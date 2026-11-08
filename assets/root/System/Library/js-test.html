@@ -1,0 +1,25 @@
+<html><head><title>JS test</title>
+<style>body{font-family:sans-serif;background:#f4f5fa;margin:30px} .card{background:#fff;border-radius:14px;padding:16px;margin:10px 0;box-shadow:0 2px 8px rgba(0,0,0,.08)} .ok{color:#1a7f37;font-weight:bold} .big{font-size:28px}</style>
+</head><body>
+<h1 id="title">JavaScript in Voyager</h1>
+<div class="card" id="info">waiting for script…</div>
+<div class="card"><span id="counter" class="big">0</span> ticks (setInterval)</div>
+<div class="card" id="list"></div>
+<div class="card" id="fetch">fetch: pending…</div>
+<script>
+document.getElementById('info').innerHTML = '<span class="ok">✓ scripts run</span> — ' + navigator.userAgent.split(' ').slice(-1)[0] + ', ' + [1,2,3].map(x => x * 2).join(',') + ', ' + JSON.stringify({a: 1});
+const list = document.getElementById('list');
+['createElement', 'appendChild', 'classList', 'style'].forEach((name, i) => {
+  const li = document.createElement('div');
+  li.textContent = (i + 1) + '. ' + name + ' works';
+  li.classList.add('item');
+  li.style.color = ['#d1242f', '#0969da', '#8250df', '#1a7f37'][i];
+  list.appendChild(li);
+});
+let n = 0;
+setInterval(() => { document.getElementById('counter').textContent = String(++n); }, 500);
+fetch('https://example.com/').then(r => r.text()).then(t => {
+  document.getElementById('fetch').textContent = 'fetch: got ' + t.length + ' bytes, title = ' + /<title>(.*)<\/title>/.exec(t)[1];
+}).catch(e => { document.getElementById('fetch').textContent = 'fetch failed: ' + e; });
+document.title = 'JS test ✓';
+</script></body></html>

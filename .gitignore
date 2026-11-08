@@ -1,0 +1,10 @@
+# local build output
+build/
+build32/
+build-*/
+*.o
+*.d
+
+# marks this checkout as the development copy (bumps BUILD_NUMBER on every rebuild)
+development.cfg
+.build_number.lock

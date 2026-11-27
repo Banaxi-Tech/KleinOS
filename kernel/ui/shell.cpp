@@ -1,5 +1,6 @@
 // Desktop shell: menubar, Dock, Launchpad, Spotlight, Control Center,
 // notifications, popup menus.
+#include "drivers/sound.h"
 #include "drivers/battery.h"
 #include "ui/shell.h"
 #include "ui/wm.h"
@@ -98,7 +99,8 @@ Vector<Rect> g_lp_rects;
 bool g_cc_open;
 Rect g_cc_panel;
 int g_cc_drag = -1;         // which slider is being dragged
-float g_cc_volume = 0.6f;
+uint64_t g_vol_hud_ms;      // volume HUD: when the volume keys last changed it (0 = hidden)
+constexpr uint64_t kVolHudMs = 1600;
 bool g_dnd;
 bool g_bluetooth;
 
@@ -936,7 +938,7 @@ void draw_cc(Canvas& s, Rect clip) {
         case 4: {
             draw_tile_bg(s, t.r, false);
             const char* label = t.id == 3 ? "Liquid Glass" : "Sound";
-            float v = t.id == 3 ? glass_intensity() / 1.5f : g_cc_volume;
+            float v = t.id == 3 ? glass_intensity() / 1.5f : sound_muted() ? 0.0f : sound_volume() / 100.0f;
             s.draw_text(t.r.x + 14, t.r.y + 6, label, tc, 12, Font::Medium);
             Rect track(t.r.x + 14, t.r.y + 28, t.r.w - 28, 16);
             s.fill_round_rect(track, 8, theme().dark ? rgba(255, 255, 255, 40) : rgba(0, 0, 0, 25));
@@ -961,7 +963,7 @@ void cc_slider_set(int id, int mx) {
         if (t.id == id) {
             float v = kclamp((float)(mx - (t.r.x + 14)) / (t.r.w - 28), 0.0f, 1.0f);
             if (id == 3) set_glass_intensity(v * 1.5f);
-            else g_cc_volume = v;
+            else sound_set_volume((int)(v * 100 + 0.5f));
             damage(g_cc_panel.expand(30));
         }
 }
@@ -1059,6 +1061,7 @@ void shell_tick(uint64_t now) {
     static bool shift_was;   // menu items with a Shift variant redraw when Shift changes
     bool shift = input_mods() & MOD_SHIFT;
     if (shift != shift_was) { shift_was = shift; damage_popup(); }
+    if (g_vol_hud_ms && now - g_vol_hud_ms > kVolHudMs) { g_vol_hud_ms = 0; damage(Rect(W / 2 - 180, kMenubarHeight - 16, 360, 112)); }
     desktop_tick();
     if (shell_visible()) {
         DateTime dt = rtc_now();
@@ -1084,6 +1087,59 @@ void shell_tick(uint64_t now) {
     if (changed) { layout_notes(); for (Note& n : g_notes) damage(n.rect.expand(30)); damage(Rect(W - 400, kMenubarHeight, 400, 400)); }
 }
 
+// ---------------------------------------------------------------- volume HUD
+
+Rect vol_hud_rect() { return Rect(W / 2 - 150, kMenubarHeight + 14, 300, 52); }
+
+void volume_key(Key k) {
+    if (k == Key::Mute) {
+        sound_set_muted(!sound_muted());
+    } else {
+        // 16 steps, like most systems; a muted system comes back at its old level
+        int step = (sound_volume() * 16 + 50) / 100;
+        if (sound_muted()) sound_set_muted(false);
+        else step = kclamp(step + (k == Key::VolumeUp ? 1 : -1), 0, 16);
+        sound_set_volume(step * 100 / 16, true);
+    }
+    g_vol_hud_ms = timer_ms();
+    damage(vol_hud_rect().expand(30));
+}
+
+void draw_vol_hud(Canvas& s, Rect clip) {
+    if (!g_vol_hud_ms) return;
+    Rect r = vol_hud_rect();
+    if (!r.expand(30).intersects(clip)) return;
+    GlassStyle gs = panel_glass();
+    gs.radius = 26;
+    gs.tint = theme().dark ? rgba(40, 40, 46, 170) : rgba(250, 250, 252, 150);
+    s.save();
+    s.clip_to(clip);
+    s.draw_shadow(r, 26, 18, rgba(0, 0, 0, 60), 0, 6);
+    s.restore();
+    glass_render(s, r, gs, clip);
+    s.save();
+    s.clip_to(clip);
+    Color tc = theme().text;
+    Rect icon(r.x + 16, r.y + 15, 22, 22);
+    draw_symbol(s, icon, Symbol::Volume, tc, 1.8f);
+    bool off = sound_muted() || sound_volume() == 0;
+    if (off) s.draw_line(icon.x + 2, icon.y + 2, icon.right() - 2, icon.bottom() - 2, tc, 2.0f);
+    if (!sound_available()) {
+        s.draw_text_in(Rect(r.x + 50, r.y, r.w - 66, r.h), "No sound device", theme().text_secondary, 14, Font::Medium);
+    } else {
+        Rect track(r.x + 52, r.y + 22, r.w - 120, 8);
+        s.fill_round_rect(track, 4, theme().dark ? rgba(255, 255, 255, 45) : rgba(0, 0, 0, 30));
+        int fw = off ? 0 : track.w * sound_volume() / 100;
+        if (fw > 0) s.fill_round_rect(Rect(track.x, track.y, kmax(fw, 8), track.h), 4, tc);
+        char pct[16];
+        if (sound_muted()) snprintf(pct, sizeof(pct), "Muted");
+        else snprintf(pct, sizeof(pct), "%d%%", sound_volume());
+        s.draw_text_in(Rect(track.right() + 8, r.y, r.right() - track.right() - 22, r.h), pct, theme().text_secondary, 13,
+                       Font::Medium, Align::Right);
+    }
+    s.restore();
+}
+
 void shell_glass_rects(Vector<Rect>& out) {
     if (shell_visible()) {
         // (the menubar's glass is cached, any part of it can be redrawn on its own)
@@ -1096,6 +1152,7 @@ void shell_glass_rects(Vector<Rect>& out) {
     if (g_cc_open) { cc_layout(); out.push(g_cc_panel.expand(m)); }
     if (g_lp_open) out.push(Rect(0, 0, W, H));
     for (Note& n : g_notes) out.push(n.rect.expand(m).unite(n.rect.offset(380, 0).expand(m)));
+    if (g_vol_hud_ms) out.push(vol_hud_rect().expand(m));
 }
 
 void shell_draw_desktop(Canvas& s, Rect clip) { desktop_draw(s, clip); }
@@ -1112,6 +1169,7 @@ void shell_draw_overlays(Canvas& s, Rect clip) {
     draw_spotlight(s, clip);
     draw_notes(s, clip);
     draw_popup(s, clip);
+    draw_vol_hud(s, clip);
 }
 
 bool shell_mouse(const InputEvent& ev, uint8_t pressed, uint8_t released) {
@@ -1166,7 +1224,10 @@ bool shell_mouse(const InputEvent& ev, uint8_t pressed, uint8_t released) {
     if (g_cc_open) {
         if (g_cc_drag >= 0) {
             if (ev.buttons & MB_LEFT) cc_slider_set(g_cc_drag, mx);
-            else g_cc_drag = -1;
+            else {
+                if (g_cc_drag == 4) sound_effect(SoundEffect::Volume);   // let the new level be heard
+                g_cc_drag = -1;
+            }
             return true;
         }
         if (pressed) {
@@ -1241,6 +1302,10 @@ bool shell_mouse(const InputEvent& ev, uint8_t pressed, uint8_t released) {
 }
 
 bool shell_key(const KeyEvent& e) {
+    if (e.key == Key::VolumeUp || e.key == Key::VolumeDown || e.key == Key::Mute) {
+        if (e.pressed) volume_key(e.key);
+        return true;
+    }
     // Spotlight: Super+Space, Ctrl+Space, Alt+Space
     if (e.key == Key::Space && (e.super() || e.ctrl() || e.alt()) && shell_visible()) {
         if (g_spot_open) spot_close(); else open_spotlight();
@@ -1356,6 +1421,7 @@ void notify(const char* title, const char* body, const char* app_id) {
     n.body = body;
     n.app = app_id ? app_find(app_id) : nullptr;
     n.born = timer_ms();
+    sound_effect(SoundEffect::Notification);
     if (g_notes.size() > 4) { damage(g_notes[0].rect.expand(30)); g_notes.remove(0); }
     layout_notes();
     for (Note& x : g_notes) damage(x.rect.expand(30).unite(x.rect.offset(380, 0)));

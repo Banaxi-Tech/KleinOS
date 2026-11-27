@@ -74,7 +74,13 @@ void irq_install(int irq, IrqHandler handler) {
     irq_unmask(irq);
 }
 
-static void timer_irq(InterruptFrame*) { g_ticks = g_ticks + 1; }
+static void (*volatile g_timer_hook)();
+void timer_set_irq_hook(void (*hook)()) { g_timer_hook = hook; }
+
+static void timer_irq(InterruptFrame*) {
+    g_ticks = g_ticks + 1;
+    if (g_timer_hook) g_timer_hook();
+}
 
 uint64_t timer_ms() { return g_ticks; }
 

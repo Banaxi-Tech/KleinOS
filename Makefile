@@ -103,7 +103,7 @@ X86_ONLY := kernel/arch/boot.S kernel/arch/isr.S kernel/arch/cpu.cpp kernel/arch
 ARM_ONLY := kernel/arch/aarch64/% kernel/drivers/arm/% kernel/boot/dtb.cpp
 ifeq ($(ARCH),aarch64)
 # Drivers for x86 chipsets (port I/O, PCI) have nothing to bind to on ARM.
-ARCH_SKIP := $(X86_ONLY) drivers/ACPIBattery drivers/AR9285 drivers/GenericWiFi drivers/GenericEthernet
+ARCH_SKIP := $(X86_ONLY) drivers/ACPIBattery drivers/AR9285 drivers/GenericWiFi drivers/GenericEthernet drivers/IntelHDA
 else
 ARCH_SKIP := $(ARM_ONLY)
 endif

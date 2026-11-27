@@ -6,6 +6,7 @@
 // glass -> cursor) and copy those regions to the framebuffer. Glass needs the
 // final backdrop under it, so damage that touches a glass surface is grown to
 // cover the whole surface plus its blur margin before composing.
+#include "drivers/sound.h"
 #include "ui/wm.h"
 #include "ui/shell.h"
 #include "ui/theme.h"
@@ -48,7 +49,6 @@ uint8_t g_buttons;
 uint64_t g_frames;
 uint64_t g_last_frame_ms, g_last_shell_ms;
 uint64_t g_next_draw_ms;
-uint64_t g_last_work_ms;     // how long the last composed frame took
 bool g_cheap_drag;           // this drag is too slow for live glass on the moving window
 float g_fps;
 uint64_t g_fps_t0, g_fps_n;
@@ -232,6 +232,7 @@ void capture_now(bool window_only) {
     if (!write_bmp(*g_front, r, path)) { wm::notify("Screenshot", "Couldn't save the screenshot."); return; }
     klog("wm: screenshot %dx%d -> %s", r.w, r.h, path);
     g_flash_ms = timer_ms();
+    sound_effect(SoundEffect::Screenshot);
     add_damage(window_only ? r : Rect(0, 0, W, H));
     const char* name = strrchr(path, '/') + 1;
     wm::notify(window_only ? "Window captured" : "Screenshot saved", name, "photos");
@@ -1252,7 +1253,6 @@ void frame() {
         for (Rect& r : dmg) compose_region(r);
         for (Rect& r : dmg) present(r);
         uint64_t work_ms = timer_ms() - work_t0;
-        g_last_work_ms = work_ms;
         if (g_drag == Drag::Move && !g_cheap_drag && (g_lite || work_ms > 20)) g_cheap_drag = true;
         g_next_draw_ms = work_ms >= 8 ? timer_ms() + kmin(work_ms, (uint64_t)100) : 0;
         if (work_ms >= 30) {

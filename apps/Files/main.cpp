@@ -1,5 +1,6 @@
 // Files — Finder-style file manager: glass sidebar, icon and list views,
 // inline rename, context menu, trash and keyboard navigation.
+#include "drivers/sound.h"
 #include "ui/window.h"
 #include "ui/widgets.h"
 #include "ui/app.h"
@@ -808,7 +809,7 @@ private:
         String trash = home_path() + "/.Trash";
         if (!vfs::is_dir(trash.c_str())) vfs::mkdir(trash.c_str());
         String dest = unique_path(trash, name, nullptr);
-        if (vfs::rename(path.c_str(), dest.c_str())) wm::notify("Moved to Trash", name.c_str(), "files");
+        if (vfs::rename(path.c_str(), dest.c_str())) sound_effect(SoundEffect::Trash), wm::notify("Moved to Trash", name.c_str(), "files");
         else wm::notify("Files", "Couldn't move the item to the Trash", "files");
         reload();
     }

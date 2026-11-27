@@ -2,6 +2,7 @@
 // macOS. Click selects, double-click (or Enter) opens, drag moves an icon to another
 // grid cell (remembered per user in ~/Library/Settings/desktop.txt), right-click
 // gives Open / Show in Files / Move to Trash. Images get a real thumbnail.
+#include "drivers/sound.h"
 #include "ui/desktop.h"
 #include "ui/wm.h"
 #include "ui/shell.h"
@@ -329,7 +330,7 @@ void trash_item(int i) {
     if (!vfs::is_dir(trash.c_str())) vfs::mkdir(trash.c_str());
     String name = g_items[i].name, dest = trash + "/" + name;
     for (int n = 2; vfs::exists(dest.c_str()) && n < 1000; n++) dest = trash + "/" + name + String::format(" %d", n);
-    if (vfs::rename(g_items[i].path.c_str(), dest.c_str())) wm::notify("Moved to Trash", name.c_str(), "files");
+    if (vfs::rename(g_items[i].path.c_str(), dest.c_str())) sound_effect(SoundEffect::Trash), wm::notify("Moved to Trash", name.c_str(), "files");
     else wm::notify("Desktop", "Couldn't move the item to the Trash.", "files");
 }
 

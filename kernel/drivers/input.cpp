@@ -100,6 +100,9 @@ void handle_key(uint8_t sc, bool ext, bool pressed) {
         case 0x5B: mod(MOD_SUPER); k = Key::LSuper; break;
         case 0x5C: mod(MOD_SUPER); k = Key::RSuper; break;
         case 0x5D: k = Key::Menu; break;
+        case 0x30: k = Key::VolumeUp; break;
+        case 0x2E: k = Key::VolumeDown; break;
+        case 0x20: k = Key::Mute; break;
         case 0x35: emit_key(Key::Char, '/', pressed); return;
         default: return;
         }

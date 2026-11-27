@@ -1,3 +1,4 @@
+#include "drivers/sound.h"
 #include "sys/session.h"
 #include "ui/wm.h"
 #include "ui/app.h"
@@ -22,6 +23,7 @@ void session_enter_desktop(const char* full_name, const char* login) {
     shell_set_user(full_name, login);
     wm::set_shell_visible(true);
     klog("session: %s (%s) logged in", full_name, login);
+    sound_effect(SoundEffect::Startup);
     String msg = String("Welcome, ") + full_name + ". Press Ctrl+Space to search.";
     wm::notify("Welcome to KleinOS", msg.c_str());
     uint64_t reset_at = 0;

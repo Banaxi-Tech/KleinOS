@@ -36,6 +36,8 @@ void irq_install(int irq, IrqHandler handler, bool edge = false);
 #else
 void interrupts_init();                         // IDT + PIC remap + PIT
 void irq_install(int irq, IrqHandler handler);  // irq 0..15
+// Called from the 1 kHz timer interrupt after each tick (sound uses it to keep playing).
+void timer_set_irq_hook(void (*hook)());
 #endif
 void irq_unmask(int irq);
 void irq_mask(int irq);

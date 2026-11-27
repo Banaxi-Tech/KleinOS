@@ -2,6 +2,7 @@
 #include "arch/cpu.h"
 #include "arch/interrupts.h"
 #include "lib/log.h"
+#include "drivers/sound.h"
 
 #if defined(__aarch64__)
 #include "boot/dtb.h"
@@ -81,6 +82,10 @@ void speaker_tone(uint32_t hz) {
 }
 
 void speaker_beep(uint32_t hz, uint32_t ms) {
+    if (sound_available()) {   // real speakers: the same beep, but soft and through the volume control
+        sound_tone((float)hz, (int)ms, 30, Timbre::Square);
+        return;
+    }
     speaker_tone(hz);
     g_beep_end = timer_ms() + ms;
 }

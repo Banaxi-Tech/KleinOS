@@ -6,6 +6,8 @@
 #include "ui/theme.h"
 #include "ui/wm.h"
 #include "drivers/power.h"
+#include "drivers/sound.h"
+#include "lib/heap.h"
 #include "arch/interrupts.h"
 #include "lib/math.h"
 #include "lib/string.h"
@@ -50,6 +52,21 @@ const Step kOdeToJoy[] = {
 };
 
 uint32_t key_hz(int k) { return kKeyDefs[k].hz; }
+
+// With a sound card: real piano notes, several at once. Each note is rendered the
+// first time it's played and kept (mono, 1.8 s).
+constexpr uint32_t kNoteFrames = kSoundRate * 18 / 10;
+int16_t* g_notes[kKeys];
+
+float exact_hz(int k) {   // equal temperament from the note name (the table's Hz are for the PC speaker)
+    static const int semis[kKeys] = {0, 2, 4, 5, 7, 9, 11, 12, 14, 16, 17, 19, 21, 23, 1, 3, 6, 8, 10, 13, 15, 18, 20, 22};
+    return 261.6256f * powf(2.0f, semis[k] / 12.0f);
+}
+
+uint32_t note_on(int k) {
+    if (!g_notes[k]) g_notes[k] = sound_render_piano(exact_hz(k), kNoteFrames, 0.7f);
+    return sound_play_static(g_notes[k], kNoteFrames, 1, 85);
+}
 
 bool is_black(int k) { return kKeyDefs[k].black; }
 
@@ -167,7 +184,13 @@ public:
             uint32_t el = now - play_t0_;
             while (play_idx_ < src.size() && src[play_idx_].start <= el) {
                 const Ev& e = src[play_idx_];
-                speaker_beep(key_hz(e.key), e.dur);
+                if (sound_available()) {
+                    if (voice_[e.key]) sound_stop(voice_[e.key], 60);
+                    voice_[e.key] = note_on(e.key);
+                    off_at_[e.key] = now + e.dur + 120;
+                } else {
+                    speaker_beep(key_hz(e.key), e.dur);
+                }
                 lit_until_[e.key] = now + e.dur;
                 play_idx_++;
             }
@@ -175,6 +198,8 @@ public:
                 stop_playing();
             }
         }
+        for (int k = 0; k < kKeys; k++)   // notes let go: a short damper fade, like a real key
+            if (off_at_[k] && now >= off_at_[k]) { sound_stop(voice_[k], 220); voice_[k] = 0; off_at_[k] = 0; }
         uint32_t mask = 0;
         for (int k = 0; k < kKeys; k++) if (is_lit(k, now)) mask |= 1u << k;
         if (mask != last_mask_) { last_mask_ = mask; invalidate(); }
@@ -230,12 +255,19 @@ private:
 
     void press(int k, bool from_mouse) {
         uint32_t now = timer_ms();
-        speaker_tone(0);
-        if (from_mouse) {
+        if (sound_available()) {
+            if (voice_[k]) sound_stop(voice_[k], 40);   // striking the same key again
+            voice_[k] = note_on(k);
+            // a typed note rings out on its own; a mouse-held one until the button comes up
+            off_at_[k] = from_mouse ? 0 : now + kNoteFrames * 1000 / kSoundRate;
+            if (from_mouse) { mouse_key_ = k; mouse_t0_ = now; }
+        } else if (from_mouse) {
+            speaker_tone(0);
             speaker_tone(key_hz(k));
             mouse_key_ = k;
             mouse_t0_ = now;
         } else {
+            speaker_tone(0);
             speaker_beep(key_hz(k), kKeyBeepMs);
         }
         if (recording_) {
@@ -248,7 +280,8 @@ private:
 
     void release_mouse() {
         if (mouse_key_ < 0) return;
-        speaker_tone(0);
+        if (sound_available()) off_at_[mouse_key_] = timer_ms();
+        else speaker_tone(0);
         if (recording_ && held_ev_ >= 0 && held_ev_ < (int)rec_.size()) {
             Ev& e = rec_[held_ev_];
             uint32_t len = timer_ms() - rec_t0_ - e.start;
@@ -287,6 +320,7 @@ private:
     void stop_playing() {
         playing_ = false;
         speaker_tone(0);
+        for (int k = 0; k < kKeys; k++) if (off_at_[k]) off_at_[k] = timer_ms();
         play_btn_->text = "Play";
         demo_btn_->text = "Demo";
         invalidate();
@@ -298,6 +332,8 @@ private:
     Button* clear_btn_ = nullptr;
 
     Vector<Ev> rec_;
+    uint32_t voice_[kKeys] = {};     // sound voice per key (0 = none)
+    uint32_t off_at_[kKeys] = {};    // when to let go of it (0 = never / not playing)
     Vector<Ev> demo_;
     uint32_t demo_len_ = 0;
     bool recording_ = false;

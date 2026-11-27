@@ -26,5 +26,13 @@ bool recovery_boot();
 bool previous_version_available();          // the other slot holds a complete system
 // Clear the failed-start count (and switch to the other slot); restart afterwards.
 bool recovery_finish(bool previous_version);
+// Shift+Restart: the next start opens Recovery. False when this install can't
+// (a live USB, or a boot config from before Recovery).
+bool request_recovery();
+bool recovery_requested();                  // this Recovery start was asked for, not caused by failed starts
+// Restart or Shut Down chosen in the UI: keeps a version on trial; Restart with
+// Shift held goes to Recovery.
+[[noreturn]] void user_restart();
+[[noreturn]] void user_shutdown();
 
 }  // namespace update

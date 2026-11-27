@@ -46,6 +46,8 @@ bool input_poll(InputEvent* out);
 void input_set_pointer_hook(void (*hook)(int x, int y));
 // Time of the latest key or mouse event (0 = none yet).
 uint64_t input_last_ms();
+// Modifier keys held right now (Mod bits).
+uint8_t input_mods();
 bool input_absolute_mouse();            // true if VMware absolute pointer active
 
 enum class KeyboardLayout : uint8_t { US = 0, UK, DE, FR };

@@ -1,5 +1,5 @@
 // KleinOS Recovery: GRUB starts this instead of the login window after 3 failed
-// starts in a row (see tools/grub-hdd.cfg). Start normally again, go back to the
+// starts in a row (see tools/grub-hdd.cfg), or when Restart was chosen with Shift held. Start normally again, go back to the
 // version before the last update, reset a password, or turn the computer off.
 #include "ui/window.h"
 #include "ui/widgets.h"
@@ -27,6 +27,7 @@ public:
     RecoveryWindow() : Window("", 640, 480, WF_FULLSCREEN | WF_NO_ZOOM | WF_NO_MINIMIZE) {
         wm::set_shell_visible(false);
         prev_ok_ = update::previous_version_available();
+        asked_ = update::recovery_requested();
         show_main();
         set_ticking(false);
     }
@@ -108,8 +109,9 @@ private:
         accounts_ = false;
         opts_.clear();
         message_ = "";
-        subtitle_ = "KleinOS didn't start correctly 3 times in a row. Choose what to do.";
-        add(Symbol::Restart, "Start KleinOS", "Try a normal start again.", true, [this] {
+        subtitle_ = asked_ ? "You restarted into Recovery. Choose what to do."
+                           : "KleinOS didn't start correctly 3 times in a row. Choose what to do.";
+        add(Symbol::Restart, "Start KleinOS", asked_ ? "Start normally." : "Try a normal start again.", true, [this] {
             if (!update::recovery_finish(false)) { fail("The start-up settings on the disk couldn't be changed."); return; }
             power_reboot();
         });
@@ -154,6 +156,7 @@ private:
     int sel_ = 0;
     bool prev_ok_ = false;
     bool accounts_ = false;
+    bool asked_ = false;
     String subtitle_, message_;
 };
 

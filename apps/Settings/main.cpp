@@ -588,7 +588,7 @@ private:
     void start_check() {
         switch (update::state()) {
             case update::State::Available: update::install(); break;
-            case update::State::Ready: userdata_save_now(); power_reboot();
+            case update::State::Ready: userdata_save_now(); update::confirm_by_user(); power_reboot(); break;
             default: update::check(); break;
         }
         sync_values();

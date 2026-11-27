@@ -10,6 +10,7 @@
 #include "sys/session.h"
 #include "sys/system.h"
 #include "drivers/power.h"
+#include "sys/update.h"
 #include "drivers/rtc.h"
 #include "drivers/ata.h"
 #include "drivers/pci.h"
@@ -114,7 +115,7 @@ constexpr HelpEntry kCommands[] = {
     {"klein", "klein say <text>  -- a little mascot"},
     {"fortune", "a random thought"},
     {"beep", "speaker beep"},
-    {"reboot", "restart the machine"},
+    {"reboot", "restart the machine (reboot recovery: start Recovery)"},
     {"shutdown", "power off"},
     {"exit", "close this window"},
 };
@@ -762,8 +763,12 @@ private:
         else if (!strcmp(c, "klein")) cmd_klein(a);
         else if (!strcmp(c, "fortune")) say(String(kFortunes[timer_ms() % (sizeof(kFortunes) / sizeof(kFortunes[0]))]));
         else if (!strcmp(c, "beep")) speaker_beep(880, 120);
-        else if (!strcmp(c, "reboot")) power_reboot();
-        else if (!strcmp(c, "shutdown")) power_shutdown();
+        else if (!strcmp(c, "reboot")) {
+            update::confirm_by_user();
+            if (a.size() > 1 && !strcmp(a[1].c_str(), "recovery") && !update::request_recovery()) err("reboot: this computer can't start Recovery");
+            else power_reboot();
+        }
+        else if (!strcmp(c, "shutdown")) { update::confirm_by_user(); power_shutdown(); }
         else if (!strcmp(c, "exit")) close();
         else {
             String m = String(c) + ": command not found";

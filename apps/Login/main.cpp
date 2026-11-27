@@ -167,14 +167,14 @@ public:
         Hot* restart = new Hot(Rect(sw_ / 2 - 120, sh_ - 150, 120, 74), [](Canvas& c, Rect r) {
             draw_power(c, r, Symbol::Restart, "Restart");
         });
-        restart->on_click = [] { update::confirm_by_user(); power_reboot(); };
+        restart->on_click = [] { update::user_restart(); };
         add(restart);
         restart_ = restart;
 
         Hot* shut = new Hot(Rect(sw_ / 2, sh_ - 150, 120, 74), [](Canvas& c, Rect r) {
             draw_power(c, r, Symbol::Power, "Shut Down");
         });
-        shut->on_click = [] { update::confirm_by_user(); power_shutdown(); };
+        shut->on_click = [] { update::user_shutdown(); };
         add(shut);
         shut_ = shut;
 

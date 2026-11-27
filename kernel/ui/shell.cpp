@@ -472,8 +472,9 @@ void logo_menu_items(Vector<MenuItem>& items) {
     String lo = String("Log Out ") + g_user_name + "…";
     add(lo.c_str(), [] { request_logout(); });
     sep();
-    add("Restart…", [] { update::confirm_by_user(); power_reboot(); });
-    add("Shut Down…", [] { update::confirm_by_user(); power_shutdown(); });
+    add("Restart…", [] { update::user_restart(); });
+    items.back().shift_title = "Restart to Recovery…";
+    add("Shut Down…", [] { update::user_shutdown(); });
 }
 
 void draw_logo(Canvas& s, Rect r, Color c) {
@@ -571,7 +572,8 @@ void layout_popup(int x, int y) {
     int h = 8;
     g_popup.item_h = 26;
     for (MenuItem& m : g_popup.items) {
-        int tw = text_width(m.title.c_str(), 14) + 60 + (m.shortcut.empty() ? 0 : text_width(m.shortcut.c_str(), 13) + 20);
+        int tw = kmax(text_width(m.title.c_str(), 14), text_width(m.shift_title.c_str(), 14)) + 60 +
+                 (m.shortcut.empty() ? 0 : text_width(m.shortcut.c_str(), 13) + 20);
         if (tw > w) w = tw;
         h += m.title == "-" ? 11 : g_popup.item_h;
     }
@@ -616,7 +618,8 @@ void draw_popup(Canvas& s, Rect clip) {
         if (hov) s.fill_round_rect(ir, 6, theme().accent);
         Color fg = !m.enabled ? theme().text_tertiary : hov ? hex(0xFFFFFF) : theme().text;
         if (m.checked) draw_symbol(s, Rect(ir.x + 6, ir.y + 6, 14, 14), Symbol::Check, fg, 1.8f);
-        s.draw_text_in(Rect(ir.x + 26, ir.y, ir.w - 30, ir.h), m.title.c_str(), fg, 14);
+        const String& title = !m.shift_title.empty() && (input_mods() & MOD_SHIFT) ? m.shift_title : m.title;
+        s.draw_text_in(Rect(ir.x + 26, ir.y, ir.w - 30, ir.h), title.c_str(), fg, 14);
         if (!m.shortcut.empty())
             s.draw_text_in(Rect(ir.x, ir.y, ir.w - 10, ir.h), m.shortcut.c_str(), hov ? fg : theme().text_secondary, 13, Font::Regular, Align::Right);
         y += g_popup.item_h;
@@ -978,8 +981,8 @@ bool cc_click(int mx, int my) {
         case 6: cc_close(); request_logout(); return true;
         case 7: {
             Vector<MenuItem> items;
-            MenuItem& a = items.emplace(); a.title = "Restart"; a.action = [] { update::confirm_by_user(); power_reboot(); };
-            MenuItem& b = items.emplace(); b.title = "Shut Down"; b.action = [] { update::confirm_by_user(); power_shutdown(); };
+            MenuItem& a = items.emplace(); a.title = "Restart"; a.shift_title = "Restart to Recovery"; a.action = [] { update::user_restart(); };
+            MenuItem& b = items.emplace(); b.title = "Shut Down"; b.action = [] { update::user_shutdown(); };
             MenuItem& c = items.emplace(); c.title = "Log Out"; c.action = [] { request_logout(); };
             popup_menu(t.r.x, t.r.bottom() + 6, items);
             return true;
@@ -1053,6 +1056,9 @@ void shell_windows_changed() {
 }
 
 void shell_tick(uint64_t now) {
+    static bool shift_was;   // menu items with a Shift variant redraw when Shift changes
+    bool shift = input_mods() & MOD_SHIFT;
+    if (shift != shift_was) { shift_was = shift; damage_popup(); }
     desktop_tick();
     if (shell_visible()) {
         DateTime dt = rtc_now();

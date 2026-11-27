@@ -339,6 +339,7 @@ bool input_poll(InputEvent* out) {
 }
 
 uint64_t input_last_ms() { IrqGuard g; return g_last_input_ms; }
+uint8_t input_mods() { return g_mods; }
 void input_set_pointer_hook(void (*hook)(int, int)) { g_pointer_hook = hook; }
 #if defined(__aarch64__)
 bool input_absolute_mouse() { return g_abs_pointer; }

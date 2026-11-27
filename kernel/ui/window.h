@@ -31,6 +31,7 @@ enum WindowFlags : uint32_t {
 struct MenuItem {
     String title;              // "-" = separator
     String shortcut;           // display only, e.g. "⌘N"
+    String shift_title;        // shown instead while Shift is held (the action decides what Shift does)
     Func<void()> action;
     bool enabled = true;
     bool checked = false;

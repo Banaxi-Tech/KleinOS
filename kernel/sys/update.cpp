@@ -1,4 +1,5 @@
 #include "drivers/input.h"
+#include "drivers/power.h"
 #include "sys/update.h"
 #include "sys/update_key.h"
 #include "sys/sysconfig.h"
@@ -80,6 +81,7 @@ int g_env_fails;                // starts in a row that never got going (GRUB co
 bool g_confirmed = true;
 bool g_recovery_boot;           // GRUB opened Recovery after repeated failed starts
 bool g_boot_config_checked;
+bool g_recovery_requested;       // Shift+Restart: leave boot_fails set for GRUB
 
 net::HttpRequest* g_req;
 char g_error[120];
@@ -498,7 +500,7 @@ void poll() {
         // restarting before then goes back to the previous version.
         confirm_slot("used after settling");
     }
-    if (g_env_fails && !g_recovery_boot && now >= kStartedOkMs) {
+    if (g_env_fails && !g_recovery_boot && !g_recovery_requested && now >= kStartedOkMs) {
         klog("update: started fine after %d failed start(s)", g_env_fails > 3 ? 3 : g_env_fails);
         g_env_fails = 0;
         env_write();
@@ -619,6 +621,37 @@ bool recovery_finish(bool previous_version) {
     g_env_try = 0;
     g_env_pending[0] = 0;
     return env_write();
+}
+
+// boot_fails past 3 makes GRUB open Recovery; 9 also tells Recovery it was asked for.
+constexpr int kRecoveryAsked = 9;
+
+bool request_recovery() {
+    if (!recovery_env() || g_env_try) return false;   // an update waiting to start goes first
+    uint8_t* cfg = nullptr;
+    size_t size = 0;
+    if (!fat32::read_file("/boot/grub/grub.cfg", &cfg, &size)) return false;
+    String text((const char*)cfg, size);
+    kfree(cfg);
+    if (text.find("boot_fails") < 0) return false;    // GRUB here doesn't know Recovery yet
+    g_env_fails = kRecoveryAsked;
+    g_recovery_requested = true;
+    if (!env_write()) return false;
+    klog("update: next start opens Recovery (asked for)");
+    return true;
+}
+
+bool recovery_requested() { return recovery_env() && g_env_fails >= kRecoveryAsked; }
+
+void user_restart() {
+    confirm_by_user();
+    if (input_mods() & MOD_SHIFT) request_recovery();
+    power_reboot();
+}
+
+void user_shutdown() {
+    confirm_by_user();
+    power_shutdown();
 }
 
 State state() { return g_state; }

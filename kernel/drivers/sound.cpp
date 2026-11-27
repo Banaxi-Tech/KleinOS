@@ -36,6 +36,8 @@ void (*g_pump)();
 volatile int32_t g_master;   // Q8, from volume and mute
 int g_volume = 70;
 bool g_muted;
+bool g_effects = true;        // notification/screenshot/trash sounds
+bool g_startup = true;        // the chord when logging in
 uint64_t g_save_at;           // remember the volume a moment after it last changed
 
 constexpr char kVolumeFile[] = "/KleinOS/sound.txt";
@@ -69,8 +71,9 @@ void poll() {
     }
     if (g_save_at && timer_ms() >= g_save_at && fat32::mounted()) {
         g_save_at = 0;
-        char text[32];
-        int n = snprintf(text, sizeof(text), "volume=%d\nmuted=%d\n", g_volume, g_muted ? 1 : 0);
+        char text[64];
+        int n = snprintf(text, sizeof(text), "volume=%d\nmuted=%d\neffects=%d\nstartup=%d\n", g_volume, g_muted ? 1 : 0,
+                         g_effects ? 1 : 0, g_startup ? 1 : 0);
         if (fat32::write_file(kVolumeFile, text, (size_t)n, rtc_unix_time())) fat32::flush();
     }
 }
@@ -84,7 +87,7 @@ void load_volume() {
     uint8_t* d = nullptr;
     size_t n = 0;
     if (!fat32::read_file(kVolumeFile, &d, &n)) return;
-    char text[64];
+    char text[96];
     n = n < sizeof(text) - 1 ? n : sizeof(text) - 1;
     memcpy(text, d, n);
     text[n] = 0;
@@ -93,6 +96,10 @@ void load_volume() {
     if (v) g_volume = kclamp(atoi(v + 7), 0, 100);
     const char* m = strstr(text, "muted=");
     if (m) g_muted = atoi(m + 6) != 0;
+    const char* e = strstr(text, "effects=");
+    if (e) g_effects = atoi(e + 8) != 0;
+    const char* st = strstr(text, "startup=");
+    if (st) g_startup = atoi(st + 8) != 0;
     update_master();
 }
 
@@ -397,9 +404,10 @@ uint32_t sound_play_wav(const uint8_t* data, size_t size, int volume) {
     return sound_play(buf, frames, volume);
 }
 
-void sound_effect(SoundEffect e) {
+void sound_effect(SoundEffect e, bool force) {
     load_volume();
     if (!g_pump || g_muted) return;
+    if (!force && e != SoundEffect::Volume && (!g_effects || (e == SoundEffect::Startup && !g_startup))) return;
     // an action that makes its own sound and then posts a notification (screenshot,
     // trash, logging in) shouldn't also ding
     static uint64_t last_other;
@@ -463,6 +471,11 @@ void sound_effect(SoundEffect e) {
     if (slot < 8) { cache[slot] = b; cache_len[slot] = len; sound_play_static(b, len, 2, 100); }
     else sound_play(b, len, 100);
 }
+
+bool sound_effects_enabled() { load_volume(); return g_effects; }
+bool sound_startup_enabled() { load_volume(); return g_startup; }
+void sound_set_effects_enabled(bool on) { load_volume(); g_effects = on; g_save_at = timer_ms() + 1500; }
+void sound_set_startup_enabled(bool on) { load_volume(); g_startup = on; g_save_at = timer_ms() + 1500; }
 
 int sound_volume() { load_volume(); return g_volume; }
 bool sound_muted() { load_volume(); return g_muted; }

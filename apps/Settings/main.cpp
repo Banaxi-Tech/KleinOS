@@ -17,6 +17,7 @@
 #include "sys/update.h"
 #include "sys/sysconfig.h"
 #include "drivers/power.h"
+#include "drivers/sound.h"
 #include "sys/dl.h"
 #include "boot/multiboot2.h"
 #include "arch/cpu.h"
@@ -29,7 +30,7 @@ namespace {
 // ---------------------------------------------------------------- layout
 constexpr int kSideW = 220;          // glass sidebar
 constexpr int kListY = 116;          // first pane row in the sidebar
-constexpr int kListStep = 30;
+constexpr int kListStep = 28;
 constexpr int kX0 = 244;             // content left edge
 constexpr int kX1 = 736;             // content right edge
 constexpr int kW = kX1 - kX0;        // 492
@@ -37,7 +38,7 @@ constexpr int kRowH = 44;            // one row in a grouped box
 constexpr int kInR = kX1 - 16;       // right edge inside a group
 
 enum PaneId {
-    PN_General, PN_Appearance, PN_Wallpaper, PN_Dock, PN_Displays, PN_Network, PN_Keyboard,
+    PN_General, PN_Appearance, PN_Wallpaper, PN_Dock, PN_Displays, PN_Sound, PN_Network, PN_Keyboard,
     PN_DateTime, PN_Users, PN_Activation, PN_Update, PN_Storage, PN_Debugging, PN_About, PN_Count
 };
 
@@ -48,6 +49,7 @@ const PaneDef kPanes[PN_Count] = {
     {"Wallpaper", Symbol::Image, hex(0x5AD2F0), hex(0x0A7EC0)},
     {"Dock & Desktop", Symbol::Grid, hex(0x7D7AFF), hex(0x3E3AB8)},
     {"Displays", Symbol::Display, hex(0x3D9BFF), hex(0x0055D4)},
+    {"Sound", Symbol::Volume, hex(0xFF6A88), hex(0xD4245A)},
     {"Network", Symbol::Globe, hex(0x40C8FF), hex(0x1E6FE0)},
     {"Keyboard", Symbol::Keyboard, hex(0xE6E6EB), hex(0x9A9AA2)},
     {"Date & Time", Symbol::Clock, hex(0xFF6B61), hex(0xD42A20)},
@@ -303,6 +305,7 @@ Rect tile_rect(int i) { return Rect(kX0 + i * 170, 80, 150, 92); }
 constexpr int kAccentRowY = 212;
 constexpr int kGlassRowY = 256;
 constexpr int kReduceRowY = 300;
+constexpr int kSoundFxY = 250;
 
 Rect accent_circle(int i) { return Rect(488 + i * 26 - 12, kAccentRowY + 22 - 12, 24, 24); }
 
@@ -326,6 +329,17 @@ public:
 
         reduce = (Toggle*)add_tagged(new Toggle(Rect(670, kReduceRowY, 50, kRowH)), PN_Appearance, false);
         reduce->on_change = [this](bool on) { wm::set_reduce_transparency(on); save_prefs(); invalidate(); };
+
+        snd_volume = (Slider*)add_tagged(new Slider(Rect(kInR - 220, 80 + kRowH, 220, kRowH), 0), PN_Sound, false);
+        snd_volume->on_change = [this](float v) { sound_set_volume((int)(v * 100 + 0.5f)); snd_mute->on = sound_muted(); invalidate(); };
+        snd_mute = (Toggle*)add_tagged(new Toggle(Rect(670, 80 + 2 * kRowH, 50, kRowH)), PN_Sound, false);
+        snd_mute->on_change = [this](bool on) { sound_set_muted(on); invalidate(); };
+        snd_effects = (Toggle*)add_tagged(new Toggle(Rect(670, kSoundFxY, 50, kRowH)), PN_Sound, false);
+        snd_effects->on_change = [this](bool on) { sound_set_effects_enabled(on); invalidate(); };
+        snd_startup = (Toggle*)add_tagged(new Toggle(Rect(670, kSoundFxY + kRowH, 50, kRowH)), PN_Sound, false);
+        snd_startup->on_change = [this](bool on) { sound_set_startup_enabled(on); invalidate(); };
+        snd_test = (Button*)add_tagged(new Button(Rect(kInR - 110, kSoundFxY + 2 * kRowH + 7, 110, 30), "Play"), PN_Sound, false);
+        snd_test->on_click = [] { sound_effect(SoundEffect::Startup, true); };
 
         dock_mag = (Toggle*)add_tagged(new Toggle(Rect(670, 80, 50, kRowH)), PN_Dock, false);
         dock_mag->on_change = [this](bool on) { wm::set_dock_magnification(on); save_prefs(); invalidate(); };
@@ -432,6 +446,7 @@ public:
             case PN_Wallpaper: paint_wallpaper(c); break;
             case PN_Dock: paint_dock(c); break;
             case PN_Displays: paint_displays(c); break;
+            case PN_Sound: paint_sound(c); break;
             case PN_Network: paint_network(c); break;
             case PN_Keyboard: paint_keyboard(c); break;
             case PN_DateTime: paint_datetime(c); break;
@@ -455,7 +470,7 @@ public:
         if (x < kSideW) {
             if (y >= kListY) {
                 int k = (y - kListY) / kListStep;
-                if ((y - kListY) % kListStep < 28 && k >= 0 && k < (int)shown.size()) select_pane(shown[k]);
+                if ((y - kListY) % kListStep < 26 && k >= 0 && k < (int)shown.size()) select_pane(shown[k]);
                 return;
             }
             Window::on_mouse_down(x, y, button);
@@ -525,6 +540,11 @@ private:
     Vector<int> shown;
     TextField* search = nullptr;
     Slider* glass = nullptr;
+    Slider* snd_volume = nullptr;
+    Toggle* snd_mute = nullptr;
+    Toggle* snd_effects = nullptr;
+    Toggle* snd_startup = nullptr;
+    Button* snd_test = nullptr;
     Toggle* reduce = nullptr;
     Toggle* dock_mag = nullptr;
     Dropdown* layout = nullptr;
@@ -675,6 +695,12 @@ private:
 
     void sync_values() {
         glass->value = wm::glass_intensity() / 1.5f;
+        snd_volume->value = sound_volume() / 100.0f;
+        snd_mute->on = sound_muted();
+        snd_effects->on = sound_effects_enabled();
+        snd_startup->on = sound_startup_enabled();
+        bool have = sound_available();
+        snd_volume->enabled = snd_mute->enabled = snd_effects->enabled = snd_startup->enabled = snd_test->enabled = have;
         reduce->on = wm::reduce_transparency();
         dock_mag->on = wm::dock_magnification();
         layout->selected = (int)input_layout();
@@ -704,9 +730,9 @@ private:
             int p = shown[k];
             int y = kListY + k * kListStep;
             bool sel = p == pane;
-            if (sel) c.fill_round_rect(Rect(10, y, 200, 28), 8, t.accent);
-            mini_icon(c, 16, y + 4, 20, kPanes[p].sym, kPanes[p].top, kPanes[p].bottom);
-            c.draw_text_in(Rect(44, y, 164, 28), kPanes[p].name, sel ? t.accent_text : t.text, 13,
+            if (sel) c.fill_round_rect(Rect(10, y, 200, 26), 8, t.accent);
+            mini_icon(c, 16, y + 3, 20, kPanes[p].sym, kPanes[p].top, kPanes[p].bottom);
+            c.draw_text_in(Rect(44, y, 164, 26), kPanes[p].name, sel ? t.accent_text : t.text, 13,
                            sel ? Font::Medium : Font::Regular);
         }
     }
@@ -817,6 +843,26 @@ private:
             const PaneDef& p = kPanes[(i * 3 + 2) % PN_Count];
             mini_icon(c, cx - d / 2, y, d, p.sym, p.top, p.bottom);
         }
+    }
+
+    void paint_sound(Canvas& c) {
+        if (!snd_volume->dragging) snd_volume->value = sound_volume() / 100.0f;   // the volume keys may have changed it
+        snd_mute->on = sound_muted();
+        pane_title(c, "Sound", "Output, volume and system sounds");
+        group(c, 80, 3);
+        row_title(c, 80, 0, "Output device");
+        row_value(c, 80, 0, sound_available() ? sound_device_name() : "None found");
+        row_title(c, 80, 1, "Volume", "Also with the volume keys");
+        row_title(c, 80, 2, "Mute");
+        c.draw_text(kX0, kSoundFxY - 24, "System sounds", theme().text_secondary, 12, Font::Bold);
+        group(c, kSoundFxY, 3);
+        row_title(c, kSoundFxY, 0, "Play sound effects", "Notifications, screenshots, the Trash");
+        row_title(c, kSoundFxY, 1, "Play a sound when logging in");
+        row_title(c, kSoundFxY, 2, "Test the speakers");
+        if (!sound_available())
+            c.draw_text_in(Rect(kX0, kSoundFxY + 3 * kRowH + 12, kW, 20),
+                           "No sound device found. KleinOS plays sound through High Definition Audio.",
+                           theme().text_tertiary, 12, Font::Regular);
     }
 
     void paint_displays(Canvas& c) {

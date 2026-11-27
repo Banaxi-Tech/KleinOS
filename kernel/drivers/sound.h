@@ -40,7 +40,13 @@ uint32_t sound_play_wav(const uint8_t* data, size_t size, int volume = 100);
 bool sound_decode_wav(const uint8_t* data, size_t size, int16_t** out, uint32_t* frames);
 
 enum class SoundEffect : uint8_t { Notification, Alert, Screenshot, Trash, Startup, Volume, Pop };
-void sound_effect(SoundEffect e);
+// Plays a system sound, unless sound effects (or, for Startup, the login sound) are
+// turned off in Settings; force plays it anyway (Settings' test button).
+void sound_effect(SoundEffect e, bool force = false);
+bool sound_effects_enabled();
+void sound_set_effects_enabled(bool on);
+bool sound_startup_enabled();
+void sound_set_startup_enabled(bool on);
 
 // System volume 0..100 and mute; remembered across starts.
 int sound_volume();

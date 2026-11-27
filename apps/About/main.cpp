@@ -48,7 +48,7 @@ public:
         snprintf(disp, sizeof(disp), "%u × %u, 32-bit", fb.width, fb.height);
         uint64_t s = timer_ms() / 1000;
         snprintf(up, sizeof(up), "%lluh %02llum %02llus", (unsigned long long)(s / 3600), (unsigned long long)(s / 60 % 60), (unsigned long long)(s % 60));
-        snprintf(mods, sizeof(mods), "%zu .dl modules, %d apps", dl_modules().size(), app_count());
+        snprintf(mods, sizeof(mods), "%zu modules, %d apps", dl_modules().size(), app_count());
         const char* rows[][2] = {
             {"Processor", cpu_brand()}, {"Memory", mem}, {"Display", disp},
             {"Modules", mods}, {"Uptime", up}, {"Mode", system_boot_mode_name()},

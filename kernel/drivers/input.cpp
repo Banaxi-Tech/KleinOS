@@ -1,6 +1,7 @@
 // PS/2 keyboard (scancode set 1, translated by the i8042), PS/2 mouse with
 // wheel, and the VMware backdoor absolute pointer (QEMU's vmmouse) so the host
-// cursor moves seamlessly without grabbing.
+// cursor moves seamlessly without grabbing. On ARM the same queue and key
+// translation are fed by virtio-input (see drivers/arm/virtio_input.cpp).
 #include "drivers/input.h"
 #include "arch/cpu.h"
 #include "arch/interrupts.h"
@@ -21,11 +22,17 @@ bool g_e0;
 KeyboardLayout g_layout = KeyboardLayout::US;
 
 bool g_vmmouse;
+[[maybe_unused]] bool g_abs_pointer;   // ARM: an absolute pointer (tablet) is present
 uint8_t g_packet[4];
 int g_packet_idx;
 bool g_wheel_mouse;
 
+void (*g_pointer_hook)(int, int);
+
+volatile uint64_t g_last_input_ms;
+
 void push(const InputEvent& e) {
+    g_last_input_ms = timer_ms();
     int next = (g_head + 1) % kQueueSize;
     if (next == g_tail) return;   // drop on overflow
     g_queue[g_head] = e;
@@ -71,15 +78,8 @@ void emit_key(Key k, uint32_t ch, bool pressed) {
     push(e);
 }
 
-void keyboard_irq(InterruptFrame*) {
-    uint8_t sc = inb(0x60);
-    if (sc == 0xE0) { g_e0 = true; return; }
-    bool released = sc & 0x80;
-    sc &= 0x7F;
-    bool ext = g_e0;
-    g_e0 = false;
-    bool pressed = !released;
-
+// One key transition in scancode set 1 terms (sc = make code, ext = 0xE0 prefix).
+void handle_key(uint8_t sc, bool ext, bool pressed) {
     auto mod = [&](uint8_t bit) { if (pressed) g_mods |= bit; else g_mods &= ~bit; };
     Key k = Key::None;
     if (ext) {
@@ -154,6 +154,31 @@ void keyboard_irq(InterruptFrame*) {
     emit_key(k, 0, pressed);
 }
 
+#if !defined(__aarch64__)
+void keyboard_irq(InterruptFrame*) {
+    uint8_t sc = inb(0x60);
+    if (sc == 0xE0) { g_e0 = true; return; }
+    bool released = sc & 0x80;
+    sc &= 0x7F;
+    bool ext = g_e0;
+    g_e0 = false;
+    handle_key(sc, ext, !released);
+}
+#endif
+
+void emit_mouse(int wheel) {
+    InputEvent e{};
+    e.type = InputEvent::MOUSE;
+    e.x = g_mx;
+    e.y = g_my;
+    e.buttons = g_buttons;
+    e.wheel = wheel;
+    e.key.mods = g_mods;
+    push(e);
+    if (g_pointer_hook) g_pointer_hook(g_mx, g_my);
+}
+
+#if !defined(__aarch64__)
 // ------------------------------------------------------------ mouse
 void ps2_wait_write() { for (int i = 0; i < 100000 && (inb(0x64) & 2); i++) {} }
 void ps2_wait_read() { for (int i = 0; i < 100000 && !(inb(0x64) & 1); i++) {} }
@@ -189,17 +214,6 @@ bool vmmouse_init() {
     if (id.a != ABS_VERSION) return false;
     vmcall(CMD_ABSPOINTER_COMMAND, ABS_REQUEST_ABSOLUTE);
     return true;
-}
-
-void emit_mouse(int wheel) {
-    InputEvent e{};
-    e.type = InputEvent::MOUSE;
-    e.x = g_mx;
-    e.y = g_my;
-    e.buttons = g_buttons;
-    e.wheel = wheel;
-    e.key.mods = g_mods;
-    push(e);
 }
 
 void vmmouse_read() {
@@ -244,8 +258,34 @@ void mouse_irq(InterruptFrame*) {
     emit_mouse(wheel);
 }
 
+#endif  // !__aarch64__
+
 }  // namespace
 
+#if defined(__aarch64__)
+void input_feed_key(uint8_t sc, bool ext, bool pressed) { handle_key(sc, ext, pressed); }
+
+void input_feed_pointer(int x, int y, uint8_t buttons, int wheel, bool absolute) {
+    if (absolute) { g_mx = x; g_my = y; g_abs_pointer = true; }
+    else { g_mx += x; g_my += y; }
+    if (g_mx < 0) g_mx = 0;
+    if (g_my < 0) g_my = 0;
+    if (g_mx >= g_screen_w) g_mx = g_screen_w - 1;
+    if (g_my >= g_screen_h) g_my = g_screen_h - 1;
+    g_buttons = buttons;
+    emit_mouse(wheel);
+}
+
+void input_screen_size(int* w, int* h) { *w = g_screen_w; *h = g_screen_h; }
+
+void input_init(int w, int h) {
+    g_screen_w = w;
+    g_screen_h = h;
+    g_mx = w / 2;
+    g_my = h / 2;
+    virtio_input_init();
+}
+#else
 void input_init(int w, int h) {
     g_screen_w = w;
     g_screen_h = h;
@@ -285,8 +325,12 @@ void input_init(int w, int h) {
     irq_install(1, keyboard_irq);
     irq_install(12, mouse_irq);
 }
+#endif  // __aarch64__ / x86 input_init
 
 bool input_poll(InputEvent* out) {
+#if defined(__aarch64__)
+    virtio_input_poll();
+#endif
     IrqGuard g;
     if (g_tail == g_head) return false;
     *out = g_queue[g_tail];
@@ -294,7 +338,13 @@ bool input_poll(InputEvent* out) {
     return true;
 }
 
+uint64_t input_last_ms() { IrqGuard g; return g_last_input_ms; }
+void input_set_pointer_hook(void (*hook)(int, int)) { g_pointer_hook = hook; }
+#if defined(__aarch64__)
+bool input_absolute_mouse() { return g_abs_pointer; }
+#else
 bool input_absolute_mouse() { return g_vmmouse; }
+#endif
 void input_set_layout(KeyboardLayout l) { g_layout = l; }
 KeyboardLayout input_layout() { return g_layout; }
 const char* input_layout_name(KeyboardLayout l) {

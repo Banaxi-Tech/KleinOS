@@ -663,6 +663,14 @@ int Canvas::measure_wrapped(int width, const char* s, int size, Font font, int s
 #include "third_party/stb_image.h"
 #pragma GCC diagnostic pop
 
+char* deflate_inflate(const void* data, int size, int* out_size) {
+    return stbi_zlib_decode_noheader_malloc((const char*)data, size, out_size);
+}
+
+char* zlib_inflate(const void* data, int size, int size_hint, int* out_size) {
+    return stbi_zlib_decode_malloc_guesssize_headerflag((const char*)data, size, size_hint, out_size, 1);
+}
+
 Canvas* image_decode(const uint8_t* data, size_t size) {
     int w, h, n;
     uint8_t* px = stbi_load_from_memory(data, (int)size, &w, &h, &n, 4);

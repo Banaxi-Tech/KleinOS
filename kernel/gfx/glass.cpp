@@ -17,7 +17,11 @@ struct LensMap {
     float radius, depth, dome, strength, angle;
     bool relative;
     LensPx* px;
+    uint8_t* row_ready;    // rows are filled on first use: most windows only show a title bar of glass
     uint64_t last_use;
+    // values shared by every row
+    float hw, hh, corner, depth_px, reach, inner_w, inner_h, inner_r, ramp, ca, sa, flat_w, flat_h;
+    float arc_x_radius, arc_x_scale, arc_y_radius, arc_y_scale;
 };
 
 constexpr int kMaxMaps = 24;
@@ -25,7 +29,24 @@ LensMap g_maps[kMaxMaps];
 uint64_t g_use_counter;
 
 inline float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
-inline float erf_approx(float x) { return tanhf(1.7724538509f * x); }
+
+// tanh(1.77 x) comes from a table: the library version costs dozens of divisions,
+// which is seconds of work per window on an Atom when done for every pixel.
+constexpr int kErfSteps = 512;
+constexpr float kErfRange = 3.0f;
+float g_erf[kErfSteps + 1];
+bool g_erf_ready;
+
+inline float erf_approx(float x) {
+    if (x <= -kErfRange) return g_erf[0];
+    if (x >= kErfRange) return g_erf[kErfSteps];
+    float pos = (x + kErfRange) * (kErfSteps / (2 * kErfRange));
+    int i = (int)pos;
+    float t = pos - i;
+    return g_erf[i] + (g_erf[i + 1] - g_erf[i]) * t;
+}
+
+inline float pow15(float x) { return x * sqrtf(x); }
 
 // Signed distance to a rounded rectangle centred on the origin; negative inside.
 inline float sdf(float x, float y, float hw, float hh, float r) {
@@ -56,45 +77,65 @@ inline float arc_slope(float x, const Arc& a) {
     return in / sqrtf(a.radius * a.radius - in * in) * a.scale;
 }
 
-void build_map(LensMap& m) {
-    int w = m.w, h = m.h;
-    float hw = w / 2.0f, hh = h / 2.0f;
-    float radius = clampf(m.radius, 0, kmin(hw, hh));
-    float share = m.relative ? kmin((float)w, (float)h) : 1.0f;
-    float depth = m.depth * share, dome = m.dome * share;
-    float reach = m.strength * share;
-    float inner_w = kmax(0.0f, hw - depth), inner_h = kmax(0.0f, hh - depth);
-    float inner_r = clampf(radius, 0, kmin(inner_w, inner_h));
-    float ramp = depth > 0 ? 1.0f / (depth * 1.41421356f) : 1e6f;
-    float sag = kmax(0.01f, kmin(dome, kmin(hw, hh) - 1));
-    Arc across = make_arc(sag, hw), down = make_arc(sag, hh);
-    float ca = cosf(m.angle * (float)M_PI / 180), sa = sinf(m.angle * (float)M_PI / 180);
-    const float glow_k = 0.4f, spread = 0.5f, glow_pow = 1.5f, edge_k = 0.5f, edge_w = 1.6f;
-    float glow_start = (1 - spread) * 1.41421356f, glow_range = spread * 1.41421356f;
-
-    for (int row = 0; row < h; row++) {
-        for (int col = 0; col < w; col++) {
-            LensPx& p = m.px[row * w + col];
-            float x = col + 0.5f - hw, y = row + 0.5f - hh;
-            float edge = sdf(x, y, hw, hh, radius);
-            float inside = clampf(-edge, 0, 1);
-            p.mask = (uint8_t)(inside * 255 + 0.5f);
-            if (edge >= 0) { p.dx = p.dy = 0; p.light = 0; continue; }
-            float ax = fabsf(x), ay = fabsf(y);
-            float dx = (x < 0 ? -1 : 1) * arc_slope(ax, across);
-            float dy = (y < 0 ? -1 : 1) * arc_slope(ay, down);
-            float falloff = 0.5f * (1 + erf_approx(sdf(x, y, inner_w, inner_h, inner_r) * ramp));
-            // pull inward: sample from further in
-            float ox = -dx * falloff * reach, oy = -dy * falloff * reach;
-            p.dx = (int16_t)clampf(ox * 16, -32000, 32000);
-            p.dy = (int16_t)clampf(oy * 16, -32000, 32000);
-            float facing = fabsf(clampf(x / hw, -1, 1) * ca + clampf(y / hh, -1, 1) * sa);
-            float g = glow_range > 0.001f ? glow_k * powf(clampf((facing - glow_start) / glow_range, 0, 1), glow_pow) * falloff : 0;
-            float rim = edge_k * kmax(0.0f, 1 + edge / edge_w) * powf(facing, 1.5f);
-            float amount = kmin(1.0f, g + rim);
-            p.light = (uint8_t)(amount * 255);
-        }
+void prepare_map(LensMap& m) {
+    if (!g_erf_ready) {
+        for (int i = 0; i <= kErfSteps; i++) g_erf[i] = tanhf(1.7724538509f * (-kErfRange + i * (2 * kErfRange / kErfSteps)));
+        g_erf_ready = true;
     }
+    int w = m.w, h = m.h;
+    m.hw = w / 2.0f; m.hh = h / 2.0f;
+    m.corner = clampf(m.radius, 0, kmin(m.hw, m.hh));
+    float share = m.relative ? kmin((float)w, (float)h) : 1.0f;
+    m.depth_px = m.depth * share;
+    float dome = m.dome * share;
+    m.reach = m.strength * share;
+    m.inner_w = kmax(0.0f, m.hw - m.depth_px);
+    m.inner_h = kmax(0.0f, m.hh - m.depth_px);
+    m.inner_r = clampf(m.corner, 0, kmin(m.inner_w, m.inner_h));
+    m.ramp = m.depth_px > 0 ? 1.0f / (m.depth_px * 1.41421356f) : 1e6f;
+    float sag = kmax(0.01f, kmin(dome, kmin(m.hw, m.hh) - 1));
+    Arc across = make_arc(sag, m.hw), down = make_arc(sag, m.hh);
+    m.arc_x_radius = across.radius; m.arc_x_scale = across.scale;
+    m.arc_y_radius = down.radius; m.arc_y_scale = down.scale;
+    m.ca = cosf(m.angle * (float)M_PI / 180);
+    m.sa = sinf(m.angle * (float)M_PI / 180);
+    // Far enough inside, the falloff is below what a 1/16 px offset can show and the
+    // rim is out of range, so the pixel is plain glass and needs no calculation.
+    float keep = kErfRange / m.ramp + m.corner + 2;
+    m.flat_w = m.inner_w - keep;
+    m.flat_h = m.inner_h - keep;
+}
+
+void build_row(LensMap& m, int row) {
+    int w = m.w;
+    float hw = m.hw, hh = m.hh;
+    const Arc across{m.arc_x_radius, m.arc_x_scale}, down{m.arc_y_radius, m.arc_y_scale};
+    const float glow_k = 0.4f, spread = 0.5f, edge_k = 0.5f, edge_w = 1.6f;
+    float glow_start = (1 - spread) * 1.41421356f, glow_range = spread * 1.41421356f;
+    float y = row + 0.5f - hh, ay = fabsf(y);
+    bool flat_row = m.flat_w > 0 && m.flat_h > 0 && ay <= m.flat_h;
+    for (int col = 0; col < w; col++) {
+        LensPx& p = m.px[row * w + col];
+        float x = col + 0.5f - hw, ax = fabsf(x);
+        if (flat_row && ax <= m.flat_w) { p.dx = p.dy = 0; p.light = 0; p.mask = 255; continue; }
+        float edge = sdf(x, y, hw, hh, m.corner);
+        float inside = clampf(-edge, 0, 1);
+        p.mask = (uint8_t)(inside * 255 + 0.5f);
+        if (edge >= 0) { p.dx = p.dy = 0; p.light = 0; continue; }
+        float dx = (x < 0 ? -1 : 1) * arc_slope(ax, across);
+        float dy = (y < 0 ? -1 : 1) * arc_slope(ay, down);
+        float falloff = 0.5f * (1 + erf_approx(sdf(x, y, m.inner_w, m.inner_h, m.inner_r) * m.ramp));
+        // pull inward: sample from further in
+        float ox = -dx * falloff * m.reach, oy = -dy * falloff * m.reach;
+        p.dx = (int16_t)clampf(ox * 16, -32000, 32000);
+        p.dy = (int16_t)clampf(oy * 16, -32000, 32000);
+        float facing = fabsf(clampf(x / hw, -1, 1) * m.ca + clampf(y / hh, -1, 1) * m.sa);
+        float g = glow_range > 0.001f ? glow_k * pow15(clampf((facing - glow_start) / glow_range, 0, 1)) * falloff : 0;
+        float rim = edge_k * kmax(0.0f, 1 + edge / edge_w) * pow15(facing);
+        float amount = kmin(1.0f, g + rim);
+        p.light = (uint8_t)(amount * 255);
+    }
+    m.row_ready[row] = 1;
 }
 
 LensMap& get_map(int w, int h, const GlassStyle& s) {
@@ -115,9 +156,11 @@ LensMap& get_map(int w, int h, const GlassStyle& s) {
     victim->w = w; victim->h = h;
     victim->radius = s.radius; victim->depth = s.depth; victim->dome = s.dome;
     victim->strength = s.strength; victim->relative = s.relative; victim->angle = s.light_angle;
-    victim->px = (LensPx*)kmalloc((size_t)w * h * sizeof(LensPx));
+    victim->px = (LensPx*)kmalloc((size_t)w * h * sizeof(LensPx) + h);
+    victim->row_ready = (uint8_t*)(victim->px + (size_t)w * h);
+    memset(victim->row_ready, 0, h);
     victim->last_use = g_use_counter;
-    build_map(*victim);
+    prepare_map(*victim);
     return *victim;
 }
 
@@ -213,6 +256,8 @@ void glass_render(Canvas& dst, Rect r, const GlassStyle& s, Rect clip) {
     Rect area = r.intersect(clip).intersect(dst.bounds());
     if (area.empty() || r.w < 2 || r.h < 2) return;
     LensMap& map = get_map(r.w, r.h, s);
+    for (int y = area.y; y < area.bottom(); y++)
+        if (!map.row_ready[y - r.y]) build_row(map, y - r.y);
 
     // Backdrop region: the glass rect plus a blur margin, downsampled 2x when frosted.
     int margin = glass_margin(s);

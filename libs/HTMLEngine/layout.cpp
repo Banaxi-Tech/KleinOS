@@ -99,13 +99,61 @@ void restyle(Document* d) { compute_styles(d); }
 // ================================================================ layout
 namespace {
 
+struct FloatBox {
+    uint8_t side;   // 1 left, 2 right
+    int x0, y0, x1, y1;
+};
+
 struct Ctx {
     Document* d;
     Vector<Fragment>* out;
     int viewport_w;
     int depth = 0;
     int cb_height = -1;   // definite content height of the containing block (for height: N%)
+    Vector<FloatBox> floats;   // floats of the current block formatting context, same origin as out
+    bool contain_floats = false;   // the next block starts a new formatting context
+    int avail_w = 0;      // width of the block whose inline content is being collected
 };
+
+// Content laid out into its own fragment list has its own origin, so outer floats don't apply there.
+struct FloatScope {
+    Ctx& c;
+    Vector<FloatBox> saved;
+    explicit FloatScope(Ctx& cx) : c(cx) {
+        saved = std::move(c.floats);
+        c.floats = Vector<FloatBox>();
+        c.contain_floats = true;
+    }
+    ~FloatScope() { c.floats = std::move(saved); c.contain_floats = false; }
+};
+
+void float_bounds(const Ctx& cx, int y, int h, int x, int w, int* left, int* right) {
+    *left = x;
+    *right = x + w;
+    for (const FloatBox& f : cx.floats) {
+        if (f.y1 <= y || f.y0 >= y + h || f.x1 <= x || f.x0 >= x + w) continue;
+        if (f.side == 1) *left = kmax(*left, f.x1);
+        else *right = kmin(*right, f.x0);
+    }
+}
+
+// The nearest float bottom below y, or -1.
+int next_float_bottom(const Ctx& cx, int y) {
+    int best = -1;
+    for (const FloatBox& f : cx.floats)
+        if (f.y1 > y && (best < 0 || f.y1 < best)) best = f.y1;
+    return best;
+}
+
+int cleared_y(const Ctx& cx, uint8_t which, int y) {
+    for (const FloatBox& f : cx.floats)
+        if ((f.side & which) && f.y1 > y) y = f.y1;
+    return y;
+}
+
+bool starts_formatting_context(const Style& s) {
+    return s.overflow_hidden || s.overflow_scroll || s.display == Style::Flex || s.display == Style::Grid || s.display == Style::Table;
+}
 
 struct DepthGuard {
     Ctx& c;
@@ -156,6 +204,7 @@ bool replaced(Node* n) {
 
 bool is_block_level(Node* n, int depth) {
     if (n->type != Node::Element) return false;
+    if (n->style.inline_level) return false;
     switch (n->style.display) {
     case Style::Block: case Style::ListItem: case Style::Table: case Style::TableRow: case Style::TableCell: case Style::Flex: case Style::Grid: return true;
     case Style::None: return false;
@@ -402,8 +451,10 @@ void add_replaced(Ctx& cx, Node* n, Vector<Item>& items, const String& href) {
         Vector<Fragment> sub;
         Vector<Fragment>* saved = cx.out;
         cx.out = &sub;
+        FloatScope float_scope(cx);
         int mw = kmin(max_content(n) + 4, cx.viewport_w);
         if (s.width > 0) mw = s.width;
+        else if (s.width_pct > 0) mw = kmax(1, (cx.avail_w > 0 ? cx.avail_w : cx.viewport_w) * s.width_pct / 100);
         int mb;
         int bh = layout_block(cx, n, 0, 0, mw, &mb, href);
         cx.out = saved;
@@ -458,17 +509,19 @@ void collect_inline(Ctx& cx, Node* n, Vector<Item>& items, String href) {
     const Style& s = n->style;
     if (n->tag == "br") { items.push(Item{Item::Break, String(), &s, n, href, 0, lh_of(s), 0, Fragment::Text, String()}); return; }
     if (replaced(n)) { add_replaced(cx, n, items, href); return; }
-    if (s.display == Style::InlineBlock || (s.display == Style::Inline && (color_a(s.background) || s.border_width[0]) && s.padding[1] + s.padding[3] >= 6)) {
+    if (s.display == Style::InlineBlock || s.inline_level || (s.display == Style::Inline && (color_a(s.background) || s.border_width[0]) && s.padding[1] + s.padding[3] >= 6)) {
         // atomic inline-block: lay out as a shrink-to-fit block
         Vector<Fragment> sub;
         Vector<Fragment>* saved = cx.out;
         cx.out = &sub;
+        FloatScope float_scope(cx);
         int w = s.width > 0 ? s.width + s.padding[1] + s.padding[3] + s.border_width[1] + s.border_width[3]
                             : kmin(max_content(n) + 1, cx.viewport_w);
-        if (s.width_pct > 0) w = cx.viewport_w * s.width_pct / 100;
+        if (s.width_pct > 0) w = (cx.avail_w > 0 ? cx.avail_w : cx.viewport_w) * s.width_pct / 100;
         if (s.min_width > 0) w = kmax(w, s.min_width);
         Style saved_style = n->style;
-        n->style.display = Style::Block;
+        n->style.inline_level = false;
+        if (n->style.display != Style::Flex && n->style.display != Style::Grid) n->style.display = Style::Block;
         int mb;
         int h = layout_block(cx, n, 0, 0, w, &mb, href);
         n->style = saved_style;
@@ -506,6 +559,21 @@ int layout_inline(Ctx& cx, Vector<Item>& items, int x, int y, int width, const S
     bool nowrap = block.nowrap || block.pre;
     Vector<Fragment>& out = *cx.out;
     while (i < items.size()) {
+        int line_x = x, line_w = width;
+        if (!cx.floats.empty()) {
+            // lines shorten beside floats, and move below them if even one word won't fit
+            int est = items[i].h > 0 ? items[i].h : lh_of(block);
+            for (;;) {
+                int l, r;
+                float_bounds(cx, cy, est, x, width, &l, &r);
+                line_x = l;
+                line_w = r - l;
+                if (items[i].w <= line_w || line_w == width) break;
+                int below = next_float_bottom(cx, cy);
+                if (below < 0) break;
+                cy = below;
+            }
+        }
         size_t start = i;
         int lw = 0;
         size_t end = i;
@@ -515,7 +583,7 @@ int layout_inline(Ctx& cx, Vector<Item>& items, int x, int y, int width, const S
             if (it.kind == Item::Break) break;
             if (it.kind == Item::Space) last_break = end;
             int nw = lw + it.w;
-            if (nw > width && end > start && !nowrap && !it.st->nowrap) {
+            if (nw > line_w && end > start && !nowrap && !it.st->nowrap) {
                 if (it.kind == Item::Space) break;
                 if (last_break != (size_t)-1 && last_break > start) { end = last_break; break; }
                 break;
@@ -545,10 +613,10 @@ int layout_inline(Ctx& cx, Vector<Item>& items, int x, int y, int width, const S
         }
         for (size_t k = start; k < line_end; k++)
             if (items[k].kind == Item::Atomic && items[k].h > 1 && item_valign(items[k])) descent = kmax(descent, items[k].h - ascent);
-        int lx = x;
-        if (block.text_align == Style::Center) lx = x + (width - w) / 2;
-        else if (block.text_align == Style::Right) lx = x + width - w;
-        if (lx < x && !nowrap) lx = x;
+        int lx = line_x;
+        if (block.text_align == Style::Center) lx = line_x + (line_w - w) / 2;
+        else if (block.text_align == Style::Right) lx = line_x + line_w - w;
+        if (lx < line_x && !nowrap) lx = line_x;
         int baseline = cy + ascent;
         int line_h = ascent + descent;
         auto atom_y = [&](const Item& it) {
@@ -580,6 +648,7 @@ int layout_inline(Ctx& cx, Vector<Item>& items, int x, int y, int width, const S
                     f.text = it.text;
                     f.size = 14;
                     f.color = it.st->color;
+                    f.invisible = it.st->opacity < 0.01f;
                     out.push(f);
                 }
                 px += it.w;
@@ -700,6 +769,7 @@ int min_content(Node* n, int depth) {
     if (n->type != Node::Element || n->style.display == Style::None || out_of_flow(n)) return 0;
     const Style& s = n->style;
     if (s.width > 0) return s.width + box_extra_h(s);
+    if (s.overflow_hidden || s.overflow_scroll) return box_extra_h(s);   // its content can be clipped
     if (n->tag == "img" || n->tag == "svg" || n->tag == "input") return kmin(max_content(n, depth), 400);
     if (s.nowrap) return kmin(max_content(n, depth), 600);
     int best = 0;
@@ -720,6 +790,14 @@ int layout_table(Ctx& cx, Node* table, int x, int y, int width, const String& hr
 
 void layout_positioned(Ctx& cx, Node* c, int cb_x, int cb_y, int cb_w, int cb_h, int static_y, const String& href) {
     const Style& s = c->style;
+    int original_offset[4];
+    memcpy(original_offset, c->style.offset, sizeof(original_offset));
+    struct RestoreOffsets { Node* n; int* o; ~RestoreOffsets() { memcpy(n->style.offset, o, sizeof(n->style.offset)); } } restore_offsets{c, original_offset};
+    {
+        int ref_w = s.position == Style::Fixed ? cx.viewport_w : cb_w, ref_h = s.position == Style::Fixed ? cx.d->viewport_h : cb_h;
+        for (int i = 0; i < 4; i++)
+            if (s.offset_pct[i] != kUnset) c->style.offset[i] = (i == 1 || i == 3 ? ref_w : ref_h) * s.offset_pct[i] / 100;
+    }
     int w;
     if (s.width > 0) w = s.width + s.padding[1] + s.padding[3] + s.border_width[1] + s.border_width[3];
     else if (s.width_pct > 0) w = cb_w * s.width_pct / 100;
@@ -732,6 +810,7 @@ void layout_positioned(Ctx& cx, Node* c, int cb_x, int cb_y, int cb_w, int cb_h,
     Vector<Fragment> sub;
     Vector<Fragment>* saved = cx.out;
     cx.out = &sub;
+    FloatScope float_scope(cx);
     int mb;
     Style saved_style = c->style;
     c->style.position = Style::Static;
@@ -764,6 +843,47 @@ void layout_positioned(Ctx& cx, Node* c, int cb_x, int cb_y, int cb_w, int cb_h,
 }
 
 // Children of a block container: inline runs + blocks (+ out-of-flow).
+int layout_block(Ctx& cx, Node* n, int x, int y, int avail, int* margin_bottom, const String& href);
+
+// Takes a floated element out of the flow and puts it at the first place it fits, at or below y.
+void place_float(Ctx& cx, Node* c, int x, int y, int width, const String& href) {
+    const Style& s = c->style;
+    int margins = (s.margin[1] == kUnset ? 0 : s.margin[1]) + (s.margin[3] == kUnset ? 0 : s.margin[3]);
+    int extras = s.padding[1] + s.padding[3] + s.border_width[1] + s.border_width[3] + margins;
+    int w = s.width > 0 ? s.width + extras : s.width_pct > 0 ? width * s.width_pct / 100 + margins : kmin(max_content(c) + 1, width);
+    if (s.max_width > 0) w = kmin(w, s.max_width + extras);
+    if (s.min_width > 0) w = kmax(w, s.min_width + extras);
+    w = kclamp(w, 1, kmax(width, 1));
+    if (s.clear) y = cleared_y(cx, s.clear, y);
+    uint8_t side = s.float_side;
+    Vector<Fragment> sub;
+    Vector<Fragment>* saved = cx.out;
+    int h, mb = 0;
+    {
+        cx.out = &sub;
+        FloatScope float_scope(cx);
+        Style saved_style = c->style;
+        c->style.float_side = 0;
+        if (c->style.display == Style::Inline || c->style.display == Style::InlineBlock) c->style.display = Style::Block;
+        h = layout_block(cx, c, 0, 0, w, &mb, href);
+        c->style = saved_style;
+        cx.out = saved;
+    }
+    int top = y, fx = side == 1 ? x : x + width - w;
+    for (;;) {
+        int l, r;
+        float_bounds(cx, top, kmax(h, 1), x, width, &l, &r);
+        if (r - l >= w || r - l == width) { fx = side == 1 ? l : r - w; break; }
+        int below = next_float_bottom(cx, top);
+        if (below < 0) { fx = side == 1 ? l : r - w; break; }
+        top = below;
+    }
+    size_t from = cx.out->size();
+    for (Fragment& f : sub) cx.out->push(f);
+    translate_frags(*cx.out, from, fx, top);
+    cx.floats.push(FloatBox{side, fx, top, fx + w, top + h + mb});
+}
+
 int layout_children(Ctx& cx, Node* n, int x, int y, int width, const String& href_in, int* last_mb) {
     int cy = y;
     Vector<Item> items;
@@ -789,17 +909,33 @@ int layout_children(Ctx& cx, Node* n, int x, int y, int width, const String& hre
         if (c->type == Node::Element && c->style.display == Style::Contents) {
             // children participate directly (approximation: lay out as a block container)
         }
+        if (c->type == Node::Element && c->style.float_side) {
+            flush();
+            place_float(cx, c, x, cy + pending_mb, width, href);
+            continue;
+        }
         if (is_block_level(c)) {
             flush();
+            if (c->style.clear) {
+                int cleared = cleared_y(cx, c->style.clear, cy);
+                if (cleared > cy) { cy = cleared; pending_mb = 0; }
+            }
             int mt = c->style.margin[0] == kUnset ? 0 : c->style.margin[0];
             int collapse = first_block && false ? mt : kmax(mt, pending_mb);
             if (mt < 0) collapse = pending_mb + mt;
             int mb = 0;
-            int hgt = layout_block(cx, c, x, cy + collapse, width, &mb, href);
+            int child_x = x, child_w = width;
+            if (!cx.floats.empty() && starts_formatting_context(c->style)) {
+                int l, r;
+                float_bounds(cx, cy + collapse, 1, x, width, &l, &r);
+                if (r - l >= 40) { child_x = l; child_w = r - l; }
+            }
+            int hgt = layout_block(cx, c, child_x, cy + collapse, child_w, &mb, href);
             cy += collapse + hgt;
             pending_mb = mb;
             first_block = false;
         } else {
+            cx.avail_w = width;
             collect_inline(cx, c, items, href);
         }
     }
@@ -821,6 +957,9 @@ int layout_block(Ctx& cx, Node* n, int x, int y, int avail, int* margin_bottom, 
     *margin_bottom = 0;
     if (cx.depth > 160) return 0;   // pathological nesting
     Style& s = n->style;
+    bool contains_floats = cx.contain_floats || starts_formatting_context(s) || n->has_class("clearfix") || n->has_class("cf");
+    cx.contain_floats = false;
+    size_t float_base = cx.floats.size();
     n->layout_y = y;
     int saved_h = s.height;
     if (s.height <= 0 && s.height_pct > 0 && cx.cb_height > 0) s.height = kmax(1, cx.cb_height * s.height_pct / 100 - s.padding[0] - s.padding[2]);
@@ -926,6 +1065,10 @@ int layout_block(Ctx& cx, Node* n, int x, int y, int avail, int* margin_bottom, 
         h = layout_children(cx, n, cx0, cy0, cw, href, &mb);
         h += mb;
     }
+    if (contains_floats) {
+        for (size_t i = float_base; i < cx.floats.size(); i++) h = kmax(h, cx.floats[i].y1 - cy0);
+        while (cx.floats.size() > float_base) cx.floats.remove(cx.floats.size() - 1);
+    }
     int total = h + s.padding[0] + s.padding[2] + s.border_width[0] + s.border_width[2];
     int natural = total;
     bool clips = s.overflow_hidden || s.overflow_scroll;
@@ -968,12 +1111,41 @@ int layout_block(Ctx& cx, Node* n, int x, int y, int avail, int* margin_bottom, 
         mk.box_of = idx;
         out.push(mk);
     }
+    if (s.overflow_hidden && s.nowrap) {
+        // text-overflow: ellipsis (and a plain cut): nothing may pass the right edge
+        int limit = cx0 + cw;
+        for (size_t i = content_start; i < out.size(); i++) {
+            Fragment& f = out[i];
+            if (f.r.right() <= limit) continue;
+            if (f.kind != Fragment::Text || f.r.x >= limit) { if (f.r.x >= limit) f.invisible = true; continue; }
+            int room = limit - f.r.x;
+            String text = f.text;
+            for (;;) {
+                size_t len = text.size();
+                while (len > 0 && ((uint8_t)text[len - 1] & 0xC0) == 0x80) len--;
+                if (len == 0) { text = String(); break; }
+                text = text.substr(0, len - 1);
+                if (text_width((text + "\xE2\x80\xA6").c_str(), f.size, f.font) <= room) break;
+            }
+            f.text = text + "\xE2\x80\xA6";
+            f.r.w = room;
+        }
+    }
+    if (s.tx_px || s.ty_px || s.tx_pct || s.ty_pct)
+        translate_frags(out, bgi, s.tx_px + w * s.tx_pct / 100, s.ty_px + total * s.ty_pct / 100);
     if (s.position == Style::Relative) {
         int dx = s.offset[3] != kUnset ? s.offset[3] : s.offset[1] != kUnset ? -s.offset[1] : 0;
         int dy = s.offset[0] != kUnset ? s.offset[0] : s.offset[2] != kUnset ? -s.offset[2] : 0;
         if (dx || dy) translate_frags(out, bgi, dx, dy);
     }
-    if (s.hidden) {
+    bool glow = false;
+    if (s.blur_px >= 8) {
+        // no blur filter here: a soft glow would come out as a solid block
+        glow = true;
+        for (size_t i = bgi; i < out.size(); i++)
+            if (out[i].kind == Fragment::Text || out[i].kind == Fragment::Image || out[i].kind == Fragment::Svg) glow = false;
+    }
+    if (s.hidden || glow) {
         for (size_t i = out.size(); i > bgi; i--) out.remove(i - 1);
     }
     return total;
@@ -1000,10 +1172,12 @@ int layout_flex(Ctx& cx, Node* n, int x, int y, int width, int fixed_h, const St
     auto lay_item = [&](Node* c, int w, Vector<Fragment>& dst, int* mt, int* mb) -> int {
         Vector<Fragment>* saved = cx.out;
         cx.out = &dst;
+        FloatScope float_scope(cx);
         int h;
         *mt = 0;
         *mb = 0;
-        if (c->type == Node::Text || (!is_block_level(c) && c->style.display != Style::InlineBlock && !replaced(c))) {
+        cx.avail_w = w;
+        if (c->type == Node::Text || (!is_block_level(c) && c->style.display != Style::InlineBlock && !replaced(c) && !c->style.overflow_hidden)) {
             Vector<Item> items;
             collect_inline(cx, c, items, href);
             Style plain = s;
@@ -1126,7 +1300,7 @@ int layout_flex(Ctx& cx, Node* n, int x, int y, int width, int fixed_h, const St
             else fi.basis = max_content(c) + 1 - margins;
             if (cs.max_width > 0) fi.basis = kmin(fi.basis, cs.max_width + extra);
             fi.basis += margins;
-            fi.minw = kmax(cs.min_width > 0 ? cs.min_width : 0, kmin(min_content(c), fi.basis));
+            fi.minw = cs.min_width == 0 ? 0 : kmax(cs.min_width > 0 ? cs.min_width : 0, kmin(min_content(c), fi.basis));
             if (cs.width > 0 && cs.flex_shrink == 0) fi.minw = fi.basis;
             fi.grow = cs.flex_grow;
             fi.shrink = cs.flex_shrink;
@@ -1238,61 +1412,213 @@ int layout_flex(Ctx& cx, Node* n, int x, int y, int width, int fixed_h, const St
     return h;
 }
 
+struct GridArea {
+    String name;
+    int c0, c1, r0, r1;   // half open, 0 based
+};
+
+// Reads "a a" "b c" into named rectangles. Returns the number of rows, and the widest row in *cols.
+int parse_grid_areas(const String& text, Vector<GridArea>& areas, int* cols) {
+    int row = 0;
+    *cols = 0;
+    const char* p = text.c_str();
+    while ((p = strpbrk(p, "\"'"))) {
+        char q = *p++;
+        const char* e = strchr(p, q);
+        if (!e) break;
+        int col = 0;
+        while (p < e) {
+            while (p < e && *p == ' ') p++;
+            const char* w = p;
+            while (p < e && *p != ' ') p++;
+            if (p == w) break;
+            String name(w, p - w);
+            if (name != "." && col < 16 && row < 64) {
+                GridArea* found = nullptr;
+                for (GridArea& a : areas) if (a.name == name) found = &a;
+                if (found) { found->c0 = kmin(found->c0, col); found->c1 = kmax(found->c1, col + 1); found->r0 = kmin(found->r0, row); found->r1 = kmax(found->r1, row + 1); }
+                else areas.push(GridArea{name, col, col + 1, row, row + 1});
+            }
+            col++;
+        }
+        *cols = kmax(*cols, col);
+        row++;
+        p = e + 1;
+    }
+    return row;
+}
+
+struct GridItem {
+    Node* node;
+    int c0 = 0, c1 = 1, r0 = 0, r1 = 1;
+    bool placed = false;
+    int h = 0;
+    int dx = 0;           // offset inside the cell (justify-items / justify-self)
+    Vector<Fragment> frags;
+};
+
+// A line number (negative = from the end, 0 = unset) as a 0 based track boundary.
+static int grid_line(int line, int tracks) { return line > 0 ? line - 1 : line < 0 ? kmax(0, tracks + 1 + line) : -1; }
+
 int layout_grid(Ctx& cx, Node* n, int x, int y, int width, const String& href_in) {
     const Style& s = n->style;
     String href = link_of(cx, n, href_in);
-    Vector<Node*> kids;
+    Vector<GridArea> areas;
+    int area_cols = 0;
+    int area_rows = s.grid_areas.empty() ? 0 : parse_grid_areas(s.grid_areas, areas, &area_cols);
+    int ncols = kclamp(kmax(s.grid_ncols, area_cols), 1, 16);
+    int explicit_rows = kmax(s.grid_nrows, area_rows);
+    int gap = s.gap_col, rgap = s.gap_row;
+
+    Vector<GridItem> items;
     for (Node* c : n->children) {
         if (c->type == Node::Element && (c->style.display == Style::None || out_of_flow(c))) continue;
         if (c->type == Node::Text && c->text.trim().empty()) continue;
-        kids.push(c);
+        GridItem& it = items.emplace();
+        it.node = c;
+        if (c->type != Node::Element) continue;
+        const Style& cs = c->style;
+        int span = kclamp(cs.grid_span, 1, ncols), rspan = kmax(cs.grid_row_span, 1);
+        const GridArea* named = nullptr;
+        if (!cs.grid_area.empty()) for (GridArea& a : areas) if (a.name == cs.grid_area) named = &a;
+        if (named) { it.c0 = named->c0; it.c1 = named->c1; it.r0 = named->r0; it.r1 = named->r1; it.placed = true; continue; }
+        int c0 = grid_line(cs.grid_col_start, ncols), c1 = grid_line(cs.grid_col_end, ncols);
+        int r0 = grid_line(cs.grid_row_start, explicit_rows), r1 = grid_line(cs.grid_row_end, explicit_rows);
+        if (c0 < 0 && c1 >= 0) c0 = kmax(0, c1 - span);
+        if (c0 >= 0 && c1 <= c0) c1 = c0 + span;
+        if (r0 < 0 && r1 >= 0) r0 = kmax(0, r1 - rspan);
+        if (r0 >= 0 && r1 <= r0) r1 = r0 + rspan;
+        it.c0 = c0 >= 0 ? kmin(c0, ncols - 1) : -1;
+        it.c1 = c0 >= 0 ? kclamp(c1, it.c0 + 1, ncols) : span;   // width while unplaced
+        it.r0 = r0;
+        it.r1 = r0 >= 0 ? r1 : rspan;
+        it.placed = c0 >= 0 && r0 >= 0;
     }
-    int ncols = s.grid_ncols > 0 ? s.grid_ncols : 1;
-    int gap = s.gap_col, rgap = s.gap_row;
-    int fixed = 0;
-    float fr = 0;
-    for (int i = 0; i < ncols; i++) { fixed += s.grid_ncols ? s.grid_col_px[i] : 0; fr += s.grid_ncols ? s.grid_col_fr[i] : 1; }
-    int avail = width - gap * (ncols - 1) - fixed;
+
+    // occupied cells, row by row
+    int nrows = kmax(explicit_rows, 1);
+    for (GridItem& it : items) if (it.placed) nrows = kmax(nrows, it.r1);
+    Vector<uint16_t> used;
+    auto grow = [&](int rows) { while ((int)used.size() < rows) used.push(0); };
+    auto mark = [&](GridItem& it) {
+        grow(it.r1);
+        for (int r = it.r0; r < it.r1; r++) for (int c = it.c0; c < it.c1; c++) used[r] |= (uint16_t)(1u << c);
+    };
+    auto fits = [&](int c0, int c1, int r0, int r1) {
+        grow(r1);
+        for (int r = r0; r < r1; r++) for (int c = c0; c < c1; c++) if (used[r] & (1u << c)) return false;
+        return true;
+    };
+    for (GridItem& it : items) if (it.placed) mark(it);
+    int cur_r = 0, cur_c = 0;
+    for (GridItem& it : items) {
+        if (it.placed) continue;
+        int span = it.c0 >= 0 ? it.c1 - it.c0 : it.c1, rspan = it.r0 >= 0 ? it.r1 - it.r0 : it.r1;
+        if (it.c0 >= 0) {   // column given, find a row
+            int r = 0;
+            while (!fits(it.c0, it.c1, r, r + rspan)) r++;
+            it.r0 = r; it.r1 = r + rspan;
+        } else if (it.r0 >= 0) {   // row given, find a column
+            int c = 0;
+            while (c + span < ncols && !fits(c, c + span, it.r0, it.r1)) c++;
+            it.c0 = c; it.c1 = c + span;
+        } else {
+            for (;;) {
+                if (cur_c + span > ncols) { cur_c = 0; cur_r++; continue; }
+                if (fits(cur_c, cur_c + span, cur_r, cur_r + rspan)) break;
+                cur_c++;
+            }
+            it.c0 = cur_c; it.c1 = cur_c + span; it.r0 = cur_r; it.r1 = cur_r + rspan;
+            cur_c += span;
+        }
+        it.placed = true;
+        mark(it);
+        nrows = kmax(nrows, it.r1);
+    }
+
+    // columns: fixed, then content-sized when fr tracks share the rest, then fr
     int cw[16];
+    bool any_fr = false;
+    for (int i = 0; i < s.grid_ncols; i++) if (s.grid_col_fr[i] > 0 && !s.grid_col_auto[i]) any_fr = true;
+    int avail = width - gap * (ncols - 1);
+    float fr = 0;
     for (int i = 0; i < ncols; i++) {
-        if (s.grid_ncols && s.grid_col_px[i] > 0) cw[i] = s.grid_col_px[i];
-        else cw[i] = fr > 0 ? (int)(kmax(avail, 0) * (s.grid_ncols ? s.grid_col_fr[i] : 1) / fr) : avail / ncols;
+        cw[i] = 0;
+        bool has_track = i < s.grid_ncols;
+        if (has_track && s.grid_col_px[i] > 0) { cw[i] = s.grid_col_px[i]; avail -= cw[i]; }
+        else if (has_track && s.grid_col_auto[i] && any_fr) {
+            for (GridItem& it : items)
+                if (it.c0 == i && it.c1 == i + 1) cw[i] = kmax(cw[i], it.node->type == Node::Element ? max_content(it.node) + 1 : text_width(it.node->text.c_str(), s.font_size));
+            cw[i] = kmin(cw[i], kmax(avail, 0));
+            avail -= cw[i];
+        } else fr += has_track ? s.grid_col_fr[i] : 1;
     }
-    Vector<Fragment>& out = *cx.out;
-    int col = 0, cy = y, row_h = 0;
-    for (Node* c : kids) {
-        int span = c->type == Node::Element ? c->style.grid_span : 1;
-        if (span < 0 || span > ncols) span = ncols;
-        if (col + span > ncols) { col = 0; cy += row_h + rgap; row_h = 0; }
-        int cx_ = x;
-        for (int i = 0; i < col; i++) cx_ += cw[i] + gap;
-        int w = 0;
-        for (int i = col; i < col + span; i++) w += cw[i] + (i > col ? gap : 0);
-        Vector<Fragment> sub;
+    for (int i = 0; i < ncols; i++) {
+        bool has_track = i < s.grid_ncols;
+        if (cw[i] == 0 && fr > 0 && !(has_track && s.grid_col_px[i] > 0))
+            cw[i] = (int)(kmax(avail, 0) * (has_track ? s.grid_col_fr[i] : 1) / fr);
+    }
+    int col_x[17];
+    col_x[0] = 0;
+    for (int i = 0; i < ncols; i++) col_x[i + 1] = col_x[i] + cw[i] + gap;
+
+    // items, then rows from their heights
+    for (GridItem& it : items) {
+        int w = col_x[it.c1] - col_x[it.c0] - gap;
+        Node* c = it.node;
+        uint8_t justify = c->type == Node::Element && c->style.justify_self != 255 ? c->style.justify_self : s.justify_items;
+        if (justify && c->type == Node::Element) {
+            int shrunk = kmin(max_content(c) + 1, w);
+            it.dx = justify == 2 ? (w - shrunk) / 2 : justify == 3 ? w - shrunk : 0;
+            w = shrunk;
+        }
         Vector<Fragment>* saved = cx.out;
-        cx.out = &sub;
-        int h;
-        if (c->type == Node::Text || (!is_block_level(c) && c->style.display != Style::InlineBlock)) {
-            Vector<Item> items;
-            collect_inline(cx, c, items, href);
-            h = layout_inline(cx, items, 0, 0, w, s);
+        cx.out = &it.frags;
+        FloatScope float_scope(cx);
+        if (c->type == Node::Text || (!is_block_level(c) && c->style.display != Style::InlineBlock && !c->style.inline_level)) {
+            Vector<Item> line;
+            collect_inline(cx, c, line, href);
+            it.h = layout_inline(cx, line, 0, 0, w, s);
         } else {
             Style saved_style = c->style;
             if (c->style.display == Style::InlineBlock) c->style.display = Style::Block;
+            c->style.inline_level = false;
             int mb;
-            h = layout_block(cx, c, 0, 0, w, &mb, href);
+            it.h = layout_block(cx, c, 0, 0, w, &mb, href);
+            it.h += mb;
             c->style = saved_style;
         }
         cx.out = saved;
-        size_t from = out.size();
-        for (Fragment& f : sub) out.push(f);
-        translate_frags(out, from, cx_, cy);
-        row_h = kmax(row_h, h);
-        col += span;
-        if (col >= ncols) { col = 0; cy += row_h + rgap; row_h = 0; }
     }
-    if (col > 0) cy += row_h; else if (cy > y) cy -= rgap;
-    return cy - y;
+    Vector<int> row_h;
+    for (int i = 0; i < nrows; i++) row_h.push(i < s.grid_nrows ? s.grid_row_px[i] : 0);
+    auto fixed_row = [&](int r) { return r < s.grid_nrows && s.grid_row_px[r] > 0; };
+    for (GridItem& it : items)
+        if (it.r1 == it.r0 + 1 && !fixed_row(it.r0)) row_h[it.r0] = kmax(row_h[it.r0], it.h);
+    auto span_h = [&](GridItem& it) {
+        int h = 0;
+        for (int r = it.r0; r < it.r1; r++) h += row_h[r] + (r > it.r0 && row_h[r] > 0 ? rgap : 0);
+        return h;
+    };
+    for (GridItem& it : items)
+        if (it.r1 > it.r0 + 1) { int extra = it.h - span_h(it); if (extra > 0) row_h[it.r1 - 1] += extra; }
+    Vector<int> row_y;
+    int cy = 0;
+    for (int r = 0; r < nrows; r++) {
+        row_y.push(cy);
+        if (row_h[r] > 0) cy += row_h[r] + rgap;
+    }
+    if (cy > 0) cy -= rgap;
+
+    Vector<Fragment>& out = *cx.out;
+    for (GridItem& it : items) {
+        uint8_t align = it.node->type == Node::Element && it.node->style.align_self != 255 ? it.node->style.align_self : s.align_items;
+        int dy = align == 2 ? (span_h(it) - it.h) / 2 : align == 3 ? span_h(it) - it.h : 0;
+        size_t from = out.size();
+        for (Fragment& f : it.frags) out.push(f);
+        translate_frags(out, from, x + col_x[it.c0] + it.dx, y + row_y[it.r0] + kmax(dy, 0));
+    }
+    return cy;
 }
 
 int layout_table(Ctx& cx, Node* table, int x, int y, int width, const String& href) {
@@ -1475,11 +1801,24 @@ static int frag_offset(Document* d, const Fragment& f, int page_scroll, Rect* cl
     return dy;
 }
 
+// Scaling costs far more than copying, so each image is scaled once per size.
+static void draw_image_cached(Canvas& c, Image& im, Rect r) {
+    if (im.canvas->width() == r.w && im.canvas->height() == r.h) { c.draw(*im.canvas, r.x, r.y); return; }
+    if (r.w <= 0 || r.h <= 0 || r.w > 4096 || r.h > 4096) { c.draw_scaled(*im.canvas, r); return; }
+    if (!im.scaled || im.scaled->width() != r.w || im.scaled->height() != r.h) {
+        delete im.scaled;
+        im.scaled = new Canvas(r.w, r.h);
+        im.scaled->clear(0);
+        im.scaled->draw_scaled(*im.canvas, Rect(0, 0, r.w, r.h));
+    }
+    c.draw(*im.scaled, r.x, r.y);
+}
+
 void paint(Document* d, Canvas& c, int scroll_y) {
     c.clear(d->background);
     Rect view(0, 0, c.width(), c.height());
     for (Fragment& f : d->frags) {
-        if (f.box_of >= 0) continue;
+        if (f.box_of >= 0 || f.invisible) continue;
         Rect clip;
         int dy = frag_offset(d, f, scroll_y, &clip);
         Rect vis = f.r.expand(f.shadow_blur + 8).offset(0, dy);
@@ -1503,7 +1842,7 @@ void paint(Document* d, Canvas& c, int scroll_y) {
                 // cover
                 float sc = kmax((float)f.r.w / im->width(), (float)f.r.h / im->height());
                 int dw = (int)(im->width() * sc), dh = (int)(im->height() * sc);
-                c.draw_scaled(*im, Rect(f.r.x + (f.r.w - dw) / 2, f.r.y + (f.r.h - dh) / 2, dw, dh));
+                draw_image_cached(c, d->images[f.image], Rect(f.r.x + (f.r.w - dw) / 2, f.r.y + (f.r.h - dh) / 2, dw, dh));
                 c.restore();
             }
             if (f.border) c.stroke_round_rect(f.r, (float)rad, f.border_color, (float)f.border);
@@ -1535,10 +1874,9 @@ void paint(Document* d, Canvas& c, int scroll_y) {
         case Fragment::Image: {
             Image* im = f.image >= 0 && f.image < (int)d->images.size() ? &d->images[f.image] : nullptr;
             if (im && im->canvas) {
-                if (im->canvas->width() == f.r.w && im->canvas->height() == f.r.h) c.draw(*im->canvas, f.r.x, f.r.y);
-                else c.draw_scaled(*im->canvas, f.r);
+                draw_image_cached(c, *im, f.r);
             } else if (f.r.w > 2 && f.r.h > 2 && !(im && im->failed && f.text.empty())) {
-                c.fill_rect(f.r, hex(0xF2F2F5));
+                if (!(im && im->failed)) c.fill_rect(f.r, hex(0xF2F2F5));
                 if (!f.text.empty() && f.r.w > 30) c.draw_text_in(f.r.inset(4, 0), f.text.c_str(), hex(0x6E6E78), 12);
             }
             break;

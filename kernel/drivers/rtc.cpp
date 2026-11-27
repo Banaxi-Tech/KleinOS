@@ -1,15 +1,20 @@
 #include "drivers/rtc.h"
 #include "arch/cpu.h"
 #include "arch/interrupts.h"
+#if defined(__aarch64__)
+#include "boot/dtb.h"
+#endif
 
 static uint64_t g_boot_unix;   // UTC unix time at g_boot_ms
 static uint64_t g_boot_ms;
 static int g_offset_min;
 
+#if !defined(__aarch64__)
 static uint8_t cmos(uint8_t reg) {
     outb(0x70, reg);
     return inb(0x71);
 }
+#endif
 
 static uint64_t to_unix(int y, int mo, int d, int h, int mi, int s) {
     // days since epoch
@@ -20,6 +25,18 @@ static uint64_t to_unix(int y, int mo, int d, int h, int mi, int s) {
     return (uint64_t)days * 86400 + h * 3600 + mi * 60 + s;
 }
 
+#if defined(__aarch64__)
+// ARM PrimeCell PL031: RTCDR (offset 0) counts seconds since 1970. QEMU's "virt" board backs it with the
+// host clock.
+void rtc_init() {
+    DtbNode n;
+    uint64_t base = 0x09010000;
+    if (dtb_find_compatible("arm,pl031", 0, &n)) base = n.reg_addr(0);
+    uint32_t now = *(volatile uint32_t*)base;
+    g_boot_unix = now > 1577836800u ? now : 1577836800u;    // sanity: not before 2020-01-01
+    g_boot_ms = timer_ms();
+}
+#else
 void rtc_init() {
     while (cmos(0x0A) & 0x80) {}
     uint8_t s = cmos(0x00), mi = cmos(0x02), h = cmos(0x04), d = cmos(0x07), mo = cmos(0x08), y = cmos(0x09);
@@ -37,7 +54,14 @@ void rtc_init() {
     g_boot_ms = timer_ms();
 }
 
+#endif
+
 uint64_t rtc_unix_time() { return g_boot_unix + (timer_ms() - g_boot_ms) / 1000; }
+void rtc_set_unix_time(uint64_t t) {
+    g_boot_unix = t;
+    g_boot_ms = timer_ms();
+}
+uint64_t rtc_make_unix(int y, int mo, int d, int h, int mi, int s) { return to_unix(y, mo, d, h, mi, s); }
 void rtc_set_utc_offset_minutes(int m) { g_offset_min = m; }
 int rtc_utc_offset_minutes() { return g_offset_min; }
 

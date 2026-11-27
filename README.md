@@ -17,6 +17,25 @@ make live            # boot straight into a live desktop (no install)
 make shot APP=browser EXTRA_CMDLINE=url=https://example.com/   # headless screenshot -> build/shot.png
 ```
 
+### ARM64 (aarch64)
+
+Builds with clang + lld (`clang`, `lld`, `qemu-system-aarch64`, `mtools`, `edk2-aarch64` firmware; no GRUB). Targets
+QEMU's `virt` machine and UEFI boards with a device tree.
+
+```sh
+make ARCH=aarch64              # build-arm64/Image (also a UEFI app) + initrd.tar
+make ARCH=aarch64 live         # boot the Image directly in QEMU (ramfb, virtio keyboard/tablet/net)
+make ARCH=aarch64 installer    # KleinOS-installer.img: UEFI installer media (also dd-able to a USB stick)
+make ARCH=aarch64 install-vm   # boot it with a blank virtio disk, run Setup...
+make ARCH=aarch64 run          # ...then boot the installed disk through UEFI
+make ARCH=aarch64 usb-image    # a whole system for a USB stick (storage=usb); `run-usb` tests it in QEMU
+```
+
+The kernel is a position-independent image that relocates itself, so firmware can load it anywhere. Drivers: GICv2/v3,
+generic timer, PL011, PL031, PSCI, ramfb or the firmware GOP framebuffer, virtio-blk/net/input, PCI (ECAM) and USB
+mass storage (EHCI). Not on ARM yet: Wi-Fi/Ethernet `.dri` drivers, ACPI battery, remote-debugger breakpoints, and
+kernel updates (they swap GRUB slots).
+
 The build number in `BUILD_NUMBER` goes up with every rebuild, but only in the development checkout, which has a
 git-ignored `development.cfg` containing `development_version=true`.
 
@@ -49,7 +68,7 @@ To build the key generator: `g++ -std=c++17 -O2 -o keygen tools/keygen.cpp && ./
   PNG/JPEG (stb_image) and SVG.
 - **Compositor:** damage-tracked, with glass surfaces (`kernel/gfx/glass.cpp`) for the menubar, Dock, window
   titlebars, sidebars, menus, Spotlight, Control Center and notifications.
-- **`.dl` dynamic libraries:** apps (`apps/<Name>/` → `/System/Apps/<Name>.dl`) and libraries
+- **`.run` apps and `.dl` libraries:** apps (`apps/<Name>/` → `/System/Apps/<Name>.run`) and libraries
   (`libs/<Name>/` → `/System/Libraries/<Name>.dl`) are ELF shared objects. The kernel loader in
   `kernel/sys/dl.cpp` links them at boot against `/System/kernel.sym`.
 - **Network:** DHCP, DNS, ARP, IPv4, ICMP, UDP and TCP, plus an HTTP/1.1 client and a TLS 1.3 client

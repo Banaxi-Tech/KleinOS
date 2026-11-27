@@ -110,3 +110,7 @@ private:
 
 // Decode PNG/JPEG/GIF/BMP into a new Canvas (nullptr on failure).
 Canvas* image_decode(const uint8_t* data, size_t size);
+// Inflate a zlib stream into a new kmalloc buffer (nullptr on failure).
+char* zlib_inflate(const void* data, int size, int size_hint, int* out_size);
+// Raw deflate, no zlib header. Free the result with kfree.
+char* deflate_inflate(const void* data, int size, int* out_size);

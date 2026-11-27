@@ -292,7 +292,13 @@ static bool parse_selector(const char*& p, const char* end, Selector& sel, char 
 }
 
 // ---------------------------------------------------------------- media queries
+static bool media_calc(const char* s, int* px);
+
 static double media_px(const char* v) {
+    const char* c = v;
+    while (*c == ' ' || *c == ':' || *c == '=' || *c == '<' || *c == '>') c++;
+    int calc_px;
+    if (!strncmp(c, "calc(", 5) && media_calc(c, &calc_px)) return calc_px;
     while (*v == ':' || *v == ' ') v++;
     char* e;
     double px = strtod(v, &e);
@@ -310,8 +316,13 @@ static bool media_one(const String& q) {
     // check each (feature) in an "and" chain
     long i = 0;
     while ((i = m.find('(', i)) >= 0) {
-        long j = m.find(')', i);
-        if (j < 0) break;
+        long j = i;
+        int depth = 0;
+        for (; j < (long)m.size(); j++) {
+            if (m[j] == '(') depth++;
+            else if (m[j] == ')' && --depth == 0) break;
+        }
+        if (j >= (long)m.size()) break;
         String f = m.substr(i + 1, j - i - 1).trim();
         if (f.starts_with("min-width")) { if (media_px(f.c_str() + 9) > g_viewport) ok = false; }
         else if (f.starts_with("max-width")) { if (media_px(f.c_str() + 9) < g_viewport) ok = false; }
@@ -907,17 +918,20 @@ static void parse_grid_cols(Style& s, const String& v) {
         if (idx >= 16) break;
         s.grid_col_px[idx] = 0;
         s.grid_col_fr[idx] = 0;
+        s.grid_col_auto[idx] = false;
         if (t.starts_with("minmax(")) {
             const char* c = strchr(t.c_str(), ',');
             t = c ? String(c + 1).trim() : String("1fr");
             if (t.ends_with(")")) t = t.substr(0, t.size() - 1);
         }
         if (t.ends_with("fr")) s.grid_col_fr[idx] = (float)strtod(t.c_str(), nullptr);
-        else if (t == "auto" || t == "min-content" || t == "max-content" || t.starts_with("fit-content")) s.grid_col_fr[idx] = 1;
+        else if (t == "auto" || t == "min-content" || t == "max-content" || t.starts_with("fit-content")) { s.grid_col_fr[idx] = 1; s.grid_col_auto[idx] = true; }
         else { int px; if (parse_len(t.c_str(), s.font_size, &px) && px > 0) s.grid_col_px[idx] = px; else s.grid_col_fr[idx] = 1; }
         s.grid_ncols++;
     }
 }
+
+static bool media_calc(const char* s, int* px) { return parse_len(s, 16, px); }
 
 // Background-image url() collection (resolved by layout through Document)
 
@@ -930,9 +944,169 @@ static int image_index(Document* d, const String& url) {
 
 void resolve_url(Document* d, const char* ref, char* out, size_t size);
 
+static void parse_grid_rows(Style& s, const String& v) {
+    s.grid_nrows = 0;
+    String toks[16];
+    int n = split_tokens(v, toks, 16);
+    for (int i = 0; i < n && s.grid_nrows < 16; i++) {
+        if (toks[i].starts_with("[")) continue;
+        int px = 0;
+        if (!parse_len(toks[i].c_str(), s.font_size, &px) || px < 0) px = 0;
+        s.grid_row_px[s.grid_nrows++] = px;
+    }
+}
+
+// "2", "span 2", "2 / 4", "1 / -1", "2 / span 3"; names are left to auto placement
+static void parse_grid_line(const String& v, int* start, int* end, int* span) {
+    *start = *end = 0;
+    *span = 1;
+    long slash = v.find('/');
+    String a = (slash >= 0 ? v.substr(0, slash) : v).trim().lower();
+    String b = slash >= 0 ? v.substr(slash + 1).trim().lower() : String();
+    if (a.starts_with("span")) *span = kclamp(atoi(a.c_str() + 4), 1, 16);
+    else *start = atoi(a.c_str());
+    if (b.starts_with("span")) *span = kclamp(atoi(b.c_str() + 4), 1, 16);
+    else if (!b.empty()) *end = atoi(b.c_str());
+}
+
+static void parse_grid_template(Style& s, const String& v) {
+    if (v.trim().lower() == "none") { s.grid_ncols = s.grid_nrows = 0; s.grid_areas = String(); return; }
+    // [ "areas" row-size? ]+ / columns, or rows / columns
+    String rows, areas;
+    long slash = -1;
+    int depth = 0;
+    bool quote = false;
+    for (size_t i = 0; i < v.size(); i++) {
+        char c = v[i];
+        if (c == '"' || c == '\'') quote = !quote;
+        else if (!quote && c == '(') depth++;
+        else if (!quote && c == ')') depth--;
+        else if (!quote && !depth && c == '/') { slash = (long)i; break; }
+    }
+    String left = slash >= 0 ? v.substr(0, slash) : v;
+    quote = false;
+    for (size_t i = 0; i < left.size(); i++) {
+        char c = left[i];
+        if (c == '"' || c == '\'') { quote = !quote; areas += '"'; continue; }
+        if (quote) areas += c; else rows += c;
+    }
+    if (!areas.empty()) s.grid_areas = areas;
+    if (!rows.trim().empty()) parse_grid_rows(s, rows.trim());
+    if (slash >= 0) parse_grid_cols(s, v.substr(slash + 1));
+}
+
+// Length or percentage; a % inside calc() comes out as a number of percent.
+static void parse_len_pct(const String& t, int fs, int* px, int* pct) {
+    *px = *pct = 0;
+    int v;
+    if (t.find('%') < 0) { if (parse_len(t.c_str(), fs, &v) && v != kUnset) *px = v; return; }
+    String as_px;
+    for (size_t i = 0; i < t.size(); i++) { if (t[i] == '%') as_px += "px"; else as_px += t[i]; }
+    if (parse_len(as_px.c_str(), fs, &v) && v != kUnset) *pct = v;
+}
+
+static int split_top(const String& v, char sep, String* out, int max) {
+    int n = 0, depth = 0;
+    String cur;
+    auto flush = [&] { if (!cur.trim().empty() && n < max) out[n++] = cur.trim(); cur = String(); };
+    for (size_t i = 0; i < v.size(); i++) {
+        char c = v[i];
+        if (c == '(') depth++;
+        else if (c == ')') depth--;
+        if (c == sep && depth == 0) flush(); else cur += c;
+    }
+    flush();
+    return n;
+}
+
+static void parse_offset(Style& s, int side, const String& v) {
+    if (v.find('%') < 0) { int px; if (parse_len(v.c_str(), s.font_size, &px)) { s.offset[side] = px; s.offset_pct[side] = kUnset; } return; }
+    int px, pct;
+    parse_len_pct(v, s.font_size, &px, &pct);
+    s.offset[side] = kUnset;
+    s.offset_pct[side] = pct;
+}
+
+static void parse_transform(Style& s, const String& v) {
+    s.tx_px = s.ty_px = s.tx_pct = s.ty_pct = 0;
+    String args[3];
+    auto arg_of = [&](const char* name) -> int {
+        long at = v.lower().find(name);
+        if (at < 0) return 0;
+        size_t i = at + strlen(name);
+        int depth = 1;
+        size_t st = i;
+        while (i < v.size() && depth) { if (v[i] == '(') depth++; else if (v[i] == ')') depth--; i++; }
+        return split_top(v.substr(st, i - st - 1), ',', args, 3);
+    };
+    if (arg_of("translate3d(") >= 1 || arg_of("translate(") >= 1) {
+        parse_len_pct(args[0], s.font_size, &s.tx_px, &s.tx_pct);
+        if (args[1].size()) parse_len_pct(args[1], s.font_size, &s.ty_px, &s.ty_pct);
+    }
+    if (arg_of("translatex(") >= 1) parse_len_pct(args[0], s.font_size, &s.tx_px, &s.tx_pct);
+    if (arg_of("translatey(") >= 1) parse_len_pct(args[0], s.font_size, &s.ty_px, &s.ty_pct);
+}
+
 static void apply_decl(Style& s, const Style& parent, const String& prop, const String& raw) {
     String v = raw.find("var(") >= 0 ? resolve_vars(raw, s.vars) : raw;
     const char* val = v.c_str();
+    if (prop == "transform") { parse_transform(s, v); return; }
+    if (prop == "translate") {
+        s.tx_px = s.ty_px = s.tx_pct = s.ty_pct = 0;
+        if (v.trim().lower() == "none") return;
+        String t[3];
+        int n = split_top(v, ' ', t, 3);
+        if (n >= 1) parse_len_pct(t[0], s.font_size, &s.tx_px, &s.tx_pct);
+        if (n >= 2) parse_len_pct(t[1], s.font_size, &s.ty_px, &s.ty_pct);
+        return;
+    }
+    if (prop == "filter") {
+        long at = v.lower().find("blur(");
+        s.blur_px = 0;
+        if (at >= 0) { int px; s.blur_px = parse_len(v.c_str() + at + 5, s.font_size, &px) && px > 0 ? px : 16; }
+        return;
+    }
+    if (prop == "top" || prop == "right" || prop == "bottom" || prop == "left") {
+        parse_offset(s, prop == "top" ? 0 : prop == "right" ? 1 : prop == "bottom" ? 2 : 3, v);
+        return;
+    }
+    if (prop == "float" || prop == "clear") {
+        String w = v.trim().lower();
+        if (prop == "float") s.float_side = w == "left" || w == "inline-start" ? 1 : w == "right" || w == "inline-end" ? 2 : 0;
+        else s.clear = w == "left" || w == "inline-start" ? 1 : w == "right" || w == "inline-end" ? 2 : w == "both" ? 3 : 0;
+        return;
+    }
+    if (prop == "justify-items" || prop == "justify-self" || prop == "place-items" || prop == "place-self") {
+        String w = v.trim().lower();
+        long sp = w.find(' ');
+        if (prop.starts_with("place") && sp > 0) w = w.substr(sp + 1).trim();
+        uint8_t j = w.find("center") >= 0 ? 2 : w.find("end") >= 0 || w.find("right") >= 0 ? 3 : w.find("start") >= 0 || w.find("left") >= 0 ? 1 : 0;
+        if (prop == "justify-items" || prop == "place-items") s.justify_items = j;
+        else s.justify_self = j;
+        if (prop.starts_with("justify")) return;
+    }
+    if (prop.starts_with("grid-")) {
+        if (prop == "grid-template-rows") { parse_grid_rows(s, v); return; }
+        if (prop == "grid-template-areas") { s.grid_areas = v.trim().lower() == "none" ? String() : v; return; }
+        if (prop == "grid-template") { parse_grid_template(s, v); return; }
+        if (prop == "grid-column") { parse_grid_line(v, &s.grid_col_start, &s.grid_col_end, &s.grid_span); return; }
+        if (prop == "grid-row") { parse_grid_line(v, &s.grid_row_start, &s.grid_row_end, &s.grid_row_span); return; }
+        if (prop == "grid-column-start") { s.grid_col_start = atoi(val); return; }
+        if (prop == "grid-column-end") { String w = v.trim().lower(); if (w.starts_with("span")) s.grid_span = kclamp(atoi(w.c_str() + 4), 1, 16); else s.grid_col_end = atoi(val); return; }
+        if (prop == "grid-row-start") { s.grid_row_start = atoi(val); return; }
+        if (prop == "grid-row-end") { String w = v.trim().lower(); if (w.starts_with("span")) s.grid_row_span = kclamp(atoi(w.c_str() + 4), 1, 16); else s.grid_row_end = atoi(val); return; }
+        if (prop == "grid-area") {
+            String w = v.trim();
+            long slash = w.find('/');
+            if (slash < 0 && atoi(val) == 0 && w != "auto") { s.grid_area = w; return; }
+            // row-start / column-start / row-end / column-end
+            int parts[4] = {0, 0, 0, 0}, n = 0;
+            const char* p = w.c_str();
+            while (n < 4) { parts[n++] = atoi(p); const char* q = strchr(p, '/'); if (!q) break; p = q + 1; }
+            s.grid_row_start = parts[0]; s.grid_col_start = parts[1]; s.grid_row_end = parts[2]; s.grid_col_end = parts[3];
+            return;
+        }
+    }
     String lv = v.lower().trim();
     if (prop[0] == 'b') {
         if (prop.starts_with("background")) s.bg_set = true;
@@ -1084,12 +1258,13 @@ static void apply_decl(Style& s, const Style& parent, const String& prop, const 
         return;
     case 'd':
         if (prop == "display") {
+            s.inline_level = false;
             if (lv == "none") s.display = Style::None;
             else if (lv == "block" || lv == "flow-root" || lv == "table-caption" || lv == "block flow") s.display = Style::Block;
             else if (lv == "inline" || lv == "inline flow") s.display = Style::Inline;
             else if (lv == "inline-block" || lv == "inline-table") s.display = Style::InlineBlock;
-            else if (lv == "inline-flex") { s.display = Style::InlineBlock; s.flex_row = true; s.display = Style::Flex; s.width = s.width; }
-            else if (lv == "inline-grid") s.display = Style::Grid;
+            else if (lv == "inline-flex") { s.display = Style::Flex; s.inline_level = true; }
+            else if (lv == "inline-grid") { s.display = Style::Grid; s.inline_level = true; }
             else if (lv == "list-item") s.display = Style::ListItem;
             else if (lv == "table") s.display = Style::Table;
             else if (lv == "table-row") s.display = Style::TableRow;
@@ -1174,10 +1349,6 @@ static void apply_decl(Style& s, const Style& parent, const String& prop, const 
             s.gap_col = kmax(0, b);
         }
         else if (prop == "grid-template-columns") parse_grid_cols(s, v);
-        else if (prop == "grid-column" || prop == "grid-column-end") {
-            if (lv.find("span") >= 0) s.grid_span = kclamp(atoi(lv.c_str() + lv.find("span") + 4), 1, 16);
-            else if (lv.find("-1") >= 0) s.grid_span = -1;
-        }
         else if (prop == "grid-row-gap" || prop == "row-gap") { int px; if (parse_len(val, s.font_size, &px)) s.gap_row = kmax(0, px); }
         return;
     case 'h':
@@ -1220,7 +1391,7 @@ static void apply_decl(Style& s, const Style& parent, const String& prop, const 
             if (prop == "margin-inline") { s.margin[3] = a; s.margin[1] = b; } else { s.margin[0] = a; s.margin[2] = b; }
         }
         else if (prop == "max-width") { int px, pct = -1; if (parse_len(val, s.font_size, &px, &pct)) { if (pct >= 0) s.max_width_pct = pct; else if (px > 0) s.max_width = px; } if (lv == "none") { s.max_width = -1; s.max_width_pct = -1; } }
-        else if (prop == "min-width") { int px; if (parse_len(val, s.font_size, &px) && px > 0) s.min_width = px; }
+        else if (prop == "min-width") { int px; if (parse_len(val, s.font_size, &px) && px >= 0) s.min_width = px; }
         else if (prop == "min-height") { int px; if (parse_len(val, s.font_size, &px) && px > 0) s.min_height = px; }
         else if (prop == "max-height") {
             s.max_height = -1;

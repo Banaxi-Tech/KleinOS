@@ -42,6 +42,11 @@ int ping_send(uint32_t ip);
 int ping_result(int seq);
 
 // ---- TCP (non-blocking sockets)
+// Accept connections on one port, from this subnet only. 0 stops listening.
+void tcp_listen(uint16_t port);
+int tcp_accept();                                       // a new socket id, or -1
+uint32_t tcp_peer_ip(int sock);
+bool in_poll();                                         // inside poll(), which must not be re-entered
 int tcp_connect(uint32_t ip, uint16_t port);  // returns socket id or -1
 enum class TcpState { Connecting, Open, Closed, Error };
 TcpState tcp_state(int sock);

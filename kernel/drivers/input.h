@@ -42,9 +42,23 @@ struct InputEvent {
 
 void input_init(int screen_w, int screen_h);
 bool input_poll(InputEvent* out);
+// Called from the mouse interrupt with the new pointer position.
+void input_set_pointer_hook(void (*hook)(int x, int y));
+// Time of the latest key or mouse event (0 = none yet).
+uint64_t input_last_ms();
 bool input_absolute_mouse();            // true if VMware absolute pointer active
 
 enum class KeyboardLayout : uint8_t { US = 0, UK, DE, FR };
 void input_set_layout(KeyboardLayout l);
 KeyboardLayout input_layout();
 const char* input_layout_name(KeyboardLayout l);
+
+#if defined(__aarch64__)
+// Fed by virtio-input (drivers/arm/virtio_input.cpp): a key transition in PS/2 scancode set 1 terms
+// (Linux evdev codes below 89 are the same numbers), and pointer motion/buttons/wheel (+ = down).
+void input_feed_key(uint8_t scancode, bool extended, bool pressed);
+void input_feed_pointer(int x, int y, uint8_t buttons, int wheel, bool absolute);
+void input_screen_size(int* w, int* h);
+void virtio_input_init();
+void virtio_input_poll();
+#endif

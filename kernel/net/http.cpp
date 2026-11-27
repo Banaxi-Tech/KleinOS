@@ -8,6 +8,7 @@
 #include "lib/kstring.h"
 #include "lib/vector.h"
 #include "arch/interrupts.h"
+#include "gfx/canvas.h"
 
 namespace net {
 
@@ -28,6 +29,9 @@ struct HttpRequest {
     uint64_t started = 0, last_activity = 0;
     int redirects = 0;
     bool waiting_net = false;
+    bool reused = false;          // sent over a kept-alive connection
+    bool http10 = false;
+    bool chunk_clean = false;     // nothing followed the final chunk
     // response
     Vector<uint8_t> raw;          // header bytes until parsed, then body bytes (raw / chunked)
     bool headers_done = false;
@@ -193,8 +197,53 @@ static String cookie_header(const char* host, const char* path) {
 }
 
 static int tls_send_cb(void* ctx, const uint8_t* data, size_t len) {
-    HttpRequest* r = (HttpRequest*)ctx;
-    return tcp_send(r->sock, data, len);
+    // ctx is the socket: a kept-alive connection outlives the request that opened it
+    return tcp_send((int)(intptr_t)ctx, data, len);
+}
+
+// ---- kept-alive connections: reusing one saves the TCP and TLS handshakes
+struct IdleConn {
+    String host;
+    uint16_t port;
+    bool https;
+    int sock;
+    tls::Client* tls;
+    uint64_t since;
+};
+
+static constexpr size_t kMaxIdle = 6;
+static constexpr uint64_t kIdleMs = 15000;
+static Vector<IdleConn> g_idle;
+
+static void close_idle(size_t i) {
+    delete g_idle[i].tls;
+    tcp_close(g_idle[i].sock);
+    g_idle.remove(i);
+}
+
+static bool conn_alive(int sock, tls::Client* c) {
+    return tcp_state(sock) == TcpState::Open && !tcp_peer_closed(sock) && !(c && (c->closed() || c->failed()));
+}
+
+static bool take_idle(HttpRequest* r) {
+    bool https = !strcmp(r->url.scheme, "https");
+    for (size_t i = 0; i < g_idle.size();) {
+        IdleConn& c = g_idle[i];
+        if (c.port != r->url.port || c.https != https || strcasecmp(c.host.c_str(), r->url.host)) { i++; continue; }
+        if (!conn_alive(c.sock, c.tls)) { close_idle(i); continue; }
+        r->sock = c.sock;
+        r->tls = c.tls;
+        g_idle.remove(i);
+        return true;
+    }
+    return false;
+}
+
+static void keep_idle(HttpRequest* r) {
+    if (g_idle.size() >= kMaxIdle) close_idle(0);
+    g_idle.push(IdleConn{String(r->url.host), r->url.port, !strcmp(r->url.scheme, "https"), r->sock, r->tls, timer_ms()});
+    r->sock = -1;
+    r->tls = nullptr;
 }
 
 static void fail(HttpRequest* r, const char* why) {
@@ -223,7 +272,7 @@ static bool start(HttpRequest* r, const char* url) {
     r->full_url = url;
     if (!url_parse(url, &r->url)) { fail(r, "invalid URL"); return false; }
     r->state = HttpState::Resolving;
-    r->dns = dns_resolve(r->url.host);
+    r->dns = -1;             // resolved in pump, unless a kept-alive connection is reused
     r->started = r->last_activity = timer_ms();
     r->resolved = false;
     return true;   // no free DNS slot yet (dns < 0): pump retries
@@ -260,7 +309,8 @@ static void send_request(HttpRequest* r) {
     String req = String::format("%s %s HTTP/1.1\r\nHost: %s\r\n", r->method.c_str(), r->url.path, r->url.host);
     req += "User-Agent: Mozilla/5.0 (X11; KleinOS x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Voyager/1.0\r\n";
     if (r->extra.find("Accept:") < 0) req += "Accept: text/html,application/xhtml+xml,text/plain;q=0.9,image/png,image/jpeg,image/gif,*/*;q=0.5\r\n";
-    req += "Accept-Language: en-US,en;q=0.8\r\nAccept-Encoding: identity\r\nConnection: close\r\n";
+    req += "Accept-Language: en-US,en;q=0.8\r\nAccept-Encoding: gzip\r\n";
+    req += r->method == "GET" ? "Connection: keep-alive\r\n" : "Connection: close\r\n";
     if (r->method == "POST") req += String::format("Content-Type: %s\r\nContent-Length: %zu\r\n", r->content_type.c_str(), r->post_body.size());
     String cookies = cookie_header(r->url.host, r->url.path);
     if (!cookies.empty()) req += String("Cookie: ") + cookies + "\r\n";
@@ -288,6 +338,7 @@ static bool parse_headers(HttpRequest* r) {
     String head((const char*)d, end);
     // status line
     long sp = head.find(' ');
+    r->http10 = head.starts_with("HTTP/1.0");
     r->status = sp > 0 ? atoi(head.c_str() + sp + 1) : 0;
     long pos = head.find("\r\n");
     while (pos >= 0 && (size_t)pos + 2 < head.size()) {
@@ -329,7 +380,7 @@ static bool dechunk(HttpRequest* r) {
         size_t len = strtoul((const char*)d + off, nullptr, 16);
         // guard: strtoul stops at non-hex; chunk extensions are ignored
         size_t data_start = line_end + 2;
-        if (len == 0) { finished = true; off = n; break; }
+        if (len == 0) { finished = true; r->chunk_clean = data_start + 2 == n; off = n; break; }
         if (data_start + len + 2 > n) break;
         for (size_t i = 0; i < len; i++) r->body.push(d[data_start + i]);
         off = data_start + len + 2;
@@ -342,7 +393,44 @@ static bool dechunk(HttpRequest* r) {
     return finished;
 }
 
+static bool strcasestr_s(const char* s, const char* needle) {
+    return String(s).lower().find(needle) >= 0;
+}
+
+static bool connection_reusable(HttpRequest* r) {
+    if (r->method != "GET" || r->http10 || r->sock < 0) return false;
+    bool framed = r->chunked ? r->chunk_clean : r->has_length ? r->raw.size() == r->content_length : r->raw.empty();
+    if (!framed) return false;
+    const char* c = http_header(r, "connection");
+    if (c && strcasestr_s(c, "close")) return false;
+    return conn_alive(r->sock, r->tls);
+}
+
+// Replaces the body of a gzip response with the decompressed bytes.
+static bool gunzip(HttpRequest* r) {
+    const uint8_t* d = r->body.data();
+    size_t n = r->body.size();
+    if (n < 18 || d[0] != 0x1F || d[1] != 0x8B || d[2] != 8) return false;
+    uint8_t flags = d[3];
+    size_t off = 10;
+    if (flags & 4) { if (off + 2 > n) return false; off += 2 + (d[off] | d[off + 1] << 8); }
+    for (int bit = 8; bit <= 16; bit <<= 1)
+        if (flags & bit) { while (off < n && d[off]) off++; off++; }
+    if (flags & 2) off += 2;
+    if (off + 8 > n) return false;
+    int out_size = 0;
+    char* out = deflate_inflate(d + off, (int)(n - off - 8), &out_size);
+    if (!out) return false;
+    Vector<uint8_t> plain;
+    plain.reserve(out_size);
+    for (int i = 0; i < out_size; i++) plain.push((uint8_t)out[i]);
+    kfree(out);
+    r->body = std::move(plain);
+    return true;
+}
+
 static void finish(HttpRequest* r) {
+    bool reusable = connection_reusable(r);
     if (!r->chunked) {
         r->body = std::move(r->raw);
         r->raw = Vector<uint8_t>();
@@ -354,17 +442,29 @@ static void finish(HttpRequest* r) {
             char next[2300];
             url_resolve(r->full_url.c_str(), loc, next, sizeof(next));
             r->redirects++;
+            if (reusable) keep_idle(r);
             reset_connection(r);
             klog("http: redirect -> %s", next);
             start(r, next);
             return;
         }
     }
+    if (reusable) keep_idle(r);
     delete r->tls;
     r->tls = nullptr;
     if (r->sock >= 0) tcp_close(r->sock);
     r->sock = -1;
+    const char* encoding = http_header(r, "content-encoding");
+    if (encoding && strstr(encoding, "gzip") && !gunzip(r)) { fail(r, "Bad compressed response"); return; }
     r->state = HttpState::Done;
+}
+
+// A kept-alive connection can die while idle; send the request on a new one.
+static void retry_fresh(HttpRequest* r) {
+    reset_connection(r);
+    r->reused = false;
+    r->state = HttpState::Resolving;
+    r->last_activity = timer_ms();
 }
 
 static void pump(HttpRequest* r) {
@@ -375,9 +475,16 @@ static void pump(HttpRequest* r) {
         else if (now - r->started > 15000) fail(r, "No network connection");
         return;
     }
+    if (r->reused && !r->headers_done && r->raw.empty() && now - r->last_activity > 8000) { retry_fresh(r); return; }
     if (now - r->last_activity > 20000) { fail(r, "Connection timed out"); return; }
     switch (r->state) {
     case HttpState::Resolving: {
+        if (r->method == "GET" && !r->reused && r->sock < 0 && take_idle(r)) {
+            r->reused = true;
+            r->last_activity = now;
+            send_request(r);
+            return;
+        }
         if (!r->resolved) {
             // a page can start more requests than there are DNS slots or sockets: wait for one
             if (r->dns < 0 && (r->dns = dns_resolve(r->url.host)) < 0) return;
@@ -387,7 +494,10 @@ static void pump(HttpRequest* r) {
             r->resolved = true;
         }
         r->sock = tcp_connect(r->ip, r->url.port);
-        if (r->sock < 0) return;
+        if (r->sock < 0) {
+            if (!g_idle.empty()) close_idle(0);   // out of sockets: idle ones are the cheapest to give up
+            return;
+        }
         r->state = HttpState::Connecting;
         r->last_activity = now;
         return;
@@ -398,7 +508,7 @@ static void pump(HttpRequest* r) {
         if (ts != TcpState::Open) { fail(r, "Connection refused"); return; }
         r->last_activity = now;
         if (!strcmp(r->url.scheme, "https")) {
-            r->tls = new tls::Client(r->url.host, tls_send_cb, r);
+            r->tls = new tls::Client(r->url.host, tls_send_cb, (void*)(intptr_t)r->sock);
             r->tls->start();
             r->state = HttpState::Handshake;
         } else {
@@ -415,7 +525,11 @@ static void pump(HttpRequest* r) {
         r->last_activity = now;
         if (r->tls) {
             r->tls->on_receive(buf, got);
-            if (r->tls->failed()) { fail(r, r->tls->error()); return; }
+            if (r->tls->failed()) {
+                if (r->reused && !r->headers_done) { retry_fresh(r); return; }
+                fail(r, r->tls->error());
+                return;
+            }
             size_t n;
             while ((n = r->tls->read(buf, sizeof(buf))) > 0)
                 for (size_t i = 0; i < n; i++) r->raw.push(buf[i]);
@@ -425,9 +539,13 @@ static void pump(HttpRequest* r) {
     }
     if (r->state == HttpState::Handshake && r->tls && r->tls->ready()) send_request(r);
     if (!r->headers_done && !parse_headers(r)) {
-        if (tcp_peer_closed(r->sock)) fail(r, r->raw.empty() ? "Empty response from server" : "Malformed response");
+        if (tcp_peer_closed(r->sock)) {
+            if (r->reused && r->raw.empty()) retry_fresh(r);
+            else fail(r, r->raw.empty() ? "Empty response from server" : "Malformed response");
+        }
         return;
     }
+    if (r->status == 204 || r->status == 304) { finish(r); return; }
     if (r->chunked) {
         if (dechunk(r)) { finish(r); return; }
     } else if (r->has_length && r->raw.size() >= r->content_length) {
@@ -443,6 +561,11 @@ static bool g_hooked;
 
 static void poll_all() {
     for (HttpRequest* r : g_active) pump(r);
+    uint64_t now = timer_ms();
+    for (size_t i = 0; i < g_idle.size();) {
+        if (now - g_idle[i].since > kIdleMs || !conn_alive(g_idle[i].sock, g_idle[i].tls)) close_idle(i);
+        else i++;
+    }
 }
 
 HttpState http_state(HttpRequest* r) {

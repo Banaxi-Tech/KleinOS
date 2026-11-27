@@ -12,6 +12,9 @@ void rtc_init();
 DateTime rtc_now();
 // Seconds since 1970-01-01 UTC.
 uint64_t rtc_unix_time();
+// Set the clock (UTC), e.g. from the network.
+void rtc_set_unix_time(uint64_t t);
+uint64_t rtc_make_unix(int year, int month, int day, int hour, int minute, int second);
 void rtc_set_utc_offset_minutes(int minutes);
 int rtc_utc_offset_minutes();
 // Helpers

@@ -1,9 +1,10 @@
-// Paint: a small bitmap editor. Tools, 16 swatches, 10-step undo, BMP save/open.
+// Paint: a small bitmap editor. Tools, 16 swatches, 10-step undo, BMP save, opens common image formats.
 #include "ui/window.h"
 #include "ui/widgets.h"
 #include "ui/app.h"
 #include "ui/theme.h"
 #include "ui/wm.h"
+#include "FileDialog/file_dialog.h"
 #include "fs/vfs.h"
 #include "sys/session.h"
 #include "lib/heap.h"
@@ -171,42 +172,29 @@ void tool_icon(Canvas& c, Rect r, int tool, Color col) {
     }
 }
 
-void collect_images(vfs::Node* dir, Vector<String>& out) {
-    for (vfs::Node* ch : dir->children) {
-        if (!ch) continue;
-        if (ch->is_dir) { collect_images(ch, out); continue; }
-        String ext = vfs::extension(ch->name.c_str());
-        if (ext == "bmp" || ext == "png" || ext == "jpg" || ext == "jpeg") out.push(vfs::path_of(ch));
-    }
-}
-
 class PaintWindow : public Window {
 public:
     PaintWindow() : Window("Paint", kWinW, kWinH, WF_NO_ZOOM) {
         art_.resize(kCW, kCH);
         art_.clear(hex(0xFFFFFF));
 
-        dd_ = (Dropdown*)add(new Dropdown(Rect(14, 13, 250, 30)));
-        open_btn_ = (Button*)add(new Button(Rect(272, 13, 70, 30), "Open"));
-        name_ = (TextField*)add(new TextField(Rect(352, 13, 168, 30), "Untitled"));
-        name_->accept_char = [](uint32_t ch) { return ch != '/'; };
-        name_->set_text("Untitled");
-        save_ = (Button*)add(new Button(Rect(528, 13, 70, 30), "Save", Button::Primary));
+        open_btn_ = (Button*)add(new Button(Rect(14, 13, 90, 30), "Open..."));
+        save_ = (Button*)add(new Button(Rect(112, 13, 80, 30), "Save", Button::Primary));
+        save_as_ = (Button*)add(new Button(Rect(200, 13, 100, 30), "Save As..."));
         undo_btn_ = (Button*)add(new Button(Rect(760, 13, 80, 30), "Undo"));
         clear_btn_ = (Button*)add(new Button(Rect(848, 13, 80, 30), "Clear", Button::Destructive));
         slider_ = (Slider*)add(new Slider(size_slider_rect(), 0.3f));
 
-        open_btn_->on_click = [this] { open_selected(); };
+        open_btn_->on_click = [this] { choose_open(); };
         save_->on_click = [this] { save_current(); };
+        save_as_->on_click = [this] { choose_save(); };
         undo_btn_->on_click = [this] { undo(); };
         clear_btn_->on_click = [this] { push_undo(); art_.clear(hex(0xFFFFFF)); invalidate(); };
 
-        set_ticking(true);
-        gen_ = vfs::generation();
-        rescan();
     }
 
     ~PaintWindow() {
+        file_dialog::close_for(this);
         for (int i = 0; i < hist_n_; i++) delete hist_[i];
     }
 
@@ -338,11 +326,6 @@ public:
         Window::on_key(e);
     }
 
-    void on_tick(uint64_t) override {
-        uint64_t g = vfs::generation();
-        if (g != gen_) { gen_ = g; rescan(); }
-    }
-
 private:
     int size_px() const { return 1 + (int)(slider_->value * 23.0f + 0.5f); }
 
@@ -389,36 +372,51 @@ private:
         invalidate();
     }
 
-    void rescan() {
-        String prev = files_.empty() ? String() : files_[dd_->selected < (int)files_.size() ? dd_->selected : 0];
-        files_.clear();
+    void choose_open() {
+        static const file_dialog::Filter kFilters[] = {{"Images", "bmp;png;jpg;jpeg;gif"}, {"All files", ""}};
         String dir = pictures_dir();
-        vfs::Node* node = vfs::lookup(dir.c_str());
-        if (node && node->is_dir) collect_images(node, files_);
-        // alphabetical
-        for (size_t i = 1; i < files_.size(); i++)
-            for (size_t j = i; j > 0 && files_[j] < files_[j - 1]; j--) {
-                String tmp = files_[j]; files_[j] = files_[j - 1]; files_[j - 1] = tmp;
-            }
-        dd_->options.clear();
-        dd_->selected = 0;
-        String base = dir + "/";
-        for (size_t i = 0; i < files_.size(); i++) {
-            String rel = files_[i].substr(base.size());
-            dd_->options.push(rel);
-            if (files_[i] == prev) dd_->selected = (int)i;
-        }
-        if (files_.empty()) dd_->options.push(String("No images in Pictures"));
-        open_btn_->enabled = !files_.empty();
-        dd_->invalidate();
-        invalidate();
+        vfs::mkdir(dir.c_str());
+        file_dialog::Options o;
+        o.directory = dir.c_str();
+        o.filters = kFilters;
+        o.filter_count = 2;
+        file_dialog::open(this, o, [this](const char* path) { load_file(path); });
     }
 
-    void open_selected() {
-        if (files_.empty()) return;
-        int i = dd_->selected;
-        if (i < 0 || i >= (int)files_.size()) return;
-        load_file(files_[i].c_str());
+    void choose_save() {
+        static const file_dialog::Filter kFilters[] = {{"BMP image", "bmp"}};
+        String dir = pictures_dir();
+        vfs::mkdir(dir.c_str());
+        String name = name_ + ".bmp";
+        file_dialog::Options o;
+        o.directory = dir.c_str();
+        o.file_name = name.c_str();
+        o.filters = kFilters;
+        o.filter_count = 1;
+        o.default_extension = "bmp";
+        file_dialog::save(this, o, [this](const char* path) {
+            // Paint only writes BMP, so the file name must say so
+            String target = path;
+            if (!target.lower().ends_with(".bmp")) target = target + ".bmp";
+            write_to(target);
+        });
+    }
+
+    void write_to(const String& path) {
+        if (save_bmp(art_, path.c_str())) {
+            path_ = path;
+            name_ = stem(path);
+            String msg = String("Saved ") + vfs::basename(path.c_str()) + ".";
+            wm::notify("Paint", msg.c_str(), "paint");
+        } else {
+            wm::notify("Paint", "Could not save the image.", "paint");
+        }
+    }
+
+    static String stem(const String& path) {
+        String base = vfs::basename(path.c_str());
+        long dot = base.rfind('.');
+        return dot > 0 ? base.substr(0, dot) : base;
     }
 
     void load_file(const char* path) {
@@ -438,25 +436,15 @@ private:
             art_.draw_scaled(*img, Rect((kCW - dw) / 2, (kCH - dh) / 2, dw, dh));
         }
         delete img;
-        String base = vfs::basename(path);
-        long dot = base.rfind('.');
-        if (dot > 0) base = base.substr(0, dot);
-        name_->set_text(base.c_str());
+        name_ = stem(path);
+        // saving writes BMP, so only a BMP can be replaced in place
+        path_ = String(path).lower().ends_with(".bmp") ? String(path) : String();
         invalidate();
     }
 
     void save_current() {
-        String name = String(name_->get_text()).trim();
-        if (name.empty()) name = "Untitled";
-        String dir = pictures_dir();
-        vfs::mkdir(dir.c_str());
-        String path = dir + "/" + name + ".bmp";
-        if (save_bmp(art_, path.c_str())) {
-            String msg = String("Saved ") + name + ".bmp to Pictures.";
-            wm::notify("Paint", msg.c_str(), "paint");
-        } else {
-            wm::notify("Paint", "Could not save the image.", "paint");
-        }
+        if (path_.empty()) choose_save();
+        else write_to(path_);
     }
 
     Canvas art_;
@@ -466,13 +454,12 @@ private:
     Color fg_ = hex(0x000000);
     bool drawing_ = false;
     int sx_ = 0, sy_ = 0, ex_ = 0, ey_ = 0;
-    Vector<String> files_;
-    uint64_t gen_ = 0;
+    String path_;
+    String name_ = "Untitled";
 
-    Dropdown* dd_ = nullptr;
     Button* open_btn_ = nullptr;
-    TextField* name_ = nullptr;
     Button* save_ = nullptr;
+    Button* save_as_ = nullptr;
     Button* undo_btn_ = nullptr;
     Button* clear_btn_ = nullptr;
     Slider* slider_ = nullptr;

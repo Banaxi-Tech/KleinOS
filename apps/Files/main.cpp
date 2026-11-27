@@ -45,7 +45,7 @@ const char* kind_name(Kind k) {
 Kind kind_for(const String& name, bool is_dir) {
     if (is_dir) return Kind::Folder;
     String ext = vfs::extension(name.c_str());
-    if (ext == "dl") return Kind::Module;
+    if (ext == "dl" || ext == "run") return Kind::Module;
     if (ext == "png" || ext == "jpg" || ext == "jpeg" || ext == "bmp" || ext == "gif") return Kind::Image;
     if (ext == "txt" || ext == "md" || ext == "log" || ext == "rtf" || ext == "readme") return Kind::Text;
     if (ext == "cpp" || ext == "h" || ext == "c" || ext == "hpp" || ext == "html" || ext == "htm" || ext == "js" ||

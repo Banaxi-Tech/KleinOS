@@ -1,8 +1,35 @@
 #pragma once
-// Low-level CPU helpers: port I/O, interrupts flag, MSRs, TSC.
+// Low-level CPU helpers: interrupts flag, idle, cache maintenance and (x86 only) port I/O, MSRs, TSC.
 #include <stdint.h>
 #include <stddef.h>
 
+#if defined(__aarch64__)
+// ------------------------------------------------------------------ AArch64
+// There is no port I/O here: code that talks to x86 ports must not be built for ARM.
+static inline void cli() { asm volatile("msr daifset, #2" ::: "memory"); }     // mask IRQ
+static inline void sti() { asm volatile("msr daifclr, #2" ::: "memory"); }     // unmask IRQ
+static inline void hlt() { asm volatile("wfi"); }
+static inline void cpu_relax() { asm volatile("yield"); }
+static inline uintptr_t read_flags() { uint64_t f; asm volatile("mrs %0, daif" : "=r"(f)); return f; }
+
+// Save/restore the interrupt mask around a critical section.
+struct IrqGuard {
+    uintptr_t flags;
+    IrqGuard() { flags = read_flags(); cli(); }
+    ~IrqGuard() { if (!(flags & 0x80)) sti(); }   // DAIF.I
+};
+
+// Generic timer: counter value and its frequency in Hz.
+static inline uint64_t cpu_counter() { uint64_t v; asm volatile("isb; mrs %0, cntvct_el0" : "=r"(v) :: "memory"); return v; }
+static inline uint64_t cpu_counter_freq() { uint64_t v; asm volatile("mrs %0, cntfrq_el0" : "=r"(v)); return v; }
+
+// Wait for the next interrupt with interrupts enabled.
+static inline void cpu_idle() { asm volatile("msr daifclr, #2; wfi" ::: "memory"); }
+// Make writes to [p, p+n) visible to instruction fetch (after loading code).
+void cpu_flush_icache(void* p, size_t n);
+static inline void cpu_store_fence() { asm volatile("dsb st" ::: "memory"); }
+#else
+// ------------------------------------------------------------------ x86 / x86-64
 static inline void outb(uint16_t port, uint8_t v) { asm volatile("outb %0, %1" ::"a"(v), "Nd"(port)); }
 static inline void outw(uint16_t port, uint16_t v) { asm volatile("outw %0, %1" ::"a"(v), "Nd"(port)); }
 static inline void outl(uint16_t port, uint32_t v) { asm volatile("outl %0, %1" ::"a"(v), "Nd"(port)); }
@@ -55,6 +82,12 @@ static inline void wrmsr(uint32_t msr, uint64_t v) {
 static inline void cpuid(uint32_t leaf, uint32_t sub, uint32_t* a, uint32_t* b, uint32_t* c, uint32_t* d) {
     asm volatile("cpuid" : "=a"(*a), "=b"(*b), "=c"(*c), "=d"(*d) : "a"(leaf), "c"(sub));
 }
+
+
+static inline void cpu_idle() { asm volatile("sti; hlt"); }
+static inline void cpu_flush_icache(void*, size_t) {}   // coherent instruction cache
+static inline void cpu_store_fence() { asm volatile("sfence"); }
+#endif
 
 // Hardware random number if RDRAND exists, else TSC-mixed fallback.
 uint64_t cpu_random64();

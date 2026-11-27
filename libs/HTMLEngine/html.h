@@ -44,6 +44,9 @@ struct Style {
     int width = -1, max_width = -1, min_width = -1, height = -1, min_height = -1;   // px; -1 = auto
     int width_pct = -1, max_width_pct = -1, height_pct = -1;
     int offset[4] = {kUnset, kUnset, kUnset, kUnset};   // top right bottom left (positioned)
+    int offset_pct[4] = {kUnset, kUnset, kUnset, kUnset};   // same, as % of the containing block
+    int tx_px = 0, ty_px = 0, tx_pct = 0, ty_pct = 0;   // transform: translate; % is of the box itself
+    int blur_px = 0;               // filter: blur
     int line_height_pct = 0;       // 0 = normal
     bool list_ordered = false;
     bool list_none = false;
@@ -54,6 +57,8 @@ struct Style {
     uint8_t justify = 0;           // 0 start 1 center 2 end 3 space-between 4 space-around 5 space-evenly
     uint8_t align_items = 0;       // 0 stretch 1 start 2 center 3 end 4 baseline
     uint8_t align_self = 255;      // 255 = auto
+    uint8_t justify_items = 0;     // grid: 0 stretch 1 start 2 center 3 end
+    uint8_t justify_self = 255;    // 255 = auto
     int gap_row = 0, gap_col = 0;
     float flex_grow = 0, flex_shrink = 1;
     int flex_basis = -1, flex_basis_pct = -1;
@@ -62,7 +67,19 @@ struct Style {
     int grid_ncols = 0;
     int grid_col_px[16];
     float grid_col_fr[16];
-    int grid_span = 1;             // grid-column: span N (-1 = full row)
+    bool grid_col_auto[16];        // auto / min-content / max-content track
+    int grid_span = 1;             // grid-column: span N
+    int grid_row_span = 1;
+    int grid_col_start = 0, grid_col_end = 0;   // line numbers, 0 = auto, negative counts from the end
+    int grid_row_start = 0, grid_row_end = 0;
+    int grid_nrows = 0;
+    int grid_row_px[16];           // 0 = sized by content
+    String grid_areas;             // grid-template-areas, as written
+    String grid_area;              // grid-area: <name>
+    // floats
+    uint8_t float_side = 0;        // 1 left, 2 right
+    uint8_t clear = 0;             // bit 1 left, bit 2 right
+    bool inline_level = false;     // inline-flex / inline-grid
     // decoration
     bool shadow = false;
     int shadow_x = 0, shadow_y = 0, shadow_blur = 0;
@@ -123,6 +140,7 @@ struct Fragment {
     Color grad_a = 0, grad_b = 0;
     bool grad_horizontal = false;
     int scroller = -1;             // index into Document::scrollers (clipped + scrolled), -1 = none
+    bool invisible = false;        // opacity: 0 control: not drawn, still clickable
     bool fixed = false;            // position: fixed (doesn't move with page scroll)
     int box_of = -1;               // marker fragment carrying the box of scroller #box_of
 };
@@ -130,6 +148,7 @@ struct Fragment {
 struct Image {
     String url;
     Canvas* canvas = nullptr;      // nullptr until loaded
+    Canvas* scaled = nullptr;      // canvas resized to its on-page size, so scrolling need not rescale
     bool requested = false, failed = false;
     bool svg = false;              // decode as SVG
     int retries = 0;               // network failures retried so far

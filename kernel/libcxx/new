@@ -1,0 +1,15 @@
+#pragma once
+// Freestanding <new> (placement new/delete) for toolchains without libstdc++ (the aarch64 cross build).
+#include <stddef.h>
+
+inline void* operator new(size_t, void* p) noexcept { return p; }
+inline void* operator new[](size_t, void* p) noexcept { return p; }
+inline void operator delete(void*, void*) noexcept {}
+inline void operator delete[](void*, void*) noexcept {}
+
+void* operator new(size_t);
+void* operator new[](size_t);
+void operator delete(void*) noexcept;
+void operator delete[](void*) noexcept;
+void operator delete(void*, size_t) noexcept;
+void operator delete[](void*, size_t) noexcept;

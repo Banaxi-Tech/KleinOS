@@ -1,4 +1,8 @@
 #include "sys/system.h"
+#include "sys/update.h"
+#include "net/wifi.h"
+#include "net/timesync.h"
+#include "sys/rdebug.h"
 #include "boot/multiboot2.h"
 #include "drivers/framebuffer.h"
 #include "drivers/power.h"
@@ -61,7 +65,7 @@ void system_create_home(const char* login) {
                         "- Right-click the desktop to change the wallpaper.\n"
                         "- Open Control Center from the menu bar to toggle Dark Mode and\n"
                         "  adjust the Liquid Glass intensity.\n\n"
-                        "Apps live in /System/Apps as .dl dynamic libraries.\n");
+                        "Apps live in /System/Apps as .run files.\n");
 }
 
 static void boot_splash(const char* status, float progress) {
@@ -116,10 +120,15 @@ static void boot_splash(const char* status, float progress) {
 
     boot_splash("Starting network…", 0.7f);
     net::init();
+    net::wifi_init_demo();
+    net::wifi_autoconnect_init();
+    net::timesync_init();
+    rdebug::init();
     boot_splash("Starting desktop…", 0.9f);
 
     wm::init();
     session_start(g_mode);
+    update::init();
 
     char autostart[64];
     if (boot_arg("autostart", autostart, sizeof(autostart))) {
@@ -134,11 +143,27 @@ static void boot_splash(const char* status, float progress) {
         }
     }
 
+    // what held up the main loop, for diagnosing stutter on slow machines
+    uint64_t last_stall_log = 0;
+    auto note_stall = [&](const char* what, void* where, uint64_t t0) {
+        uint64_t now = timer_ms(), took = now - t0;
+        if (took < 100 || (last_stall_log && now - last_stall_log < 500)) return;
+        last_stall_log = now;
+        klog("loop: %s took %u ms %p", what, (unsigned)took, where);
+    };
     for (;;) {
+        uint64_t t0 = timer_ms();
         wm::frame();
+        note_stall("frame", nullptr, t0);
+        t0 = timer_ms();
         net::poll();
-        for (int i = 0; i < g_hook_count; i++) g_hooks[i]();
+        note_stall("network", nullptr, t0);
+        for (int i = 0; i < g_hook_count; i++) {
+            t0 = timer_ms();
+            g_hooks[i]();
+            note_stall("hook", (void*)g_hooks[i], t0);
+        }
         speaker_tick();
-        asm volatile("sti; hlt");
+        cpu_idle();
     }
 }

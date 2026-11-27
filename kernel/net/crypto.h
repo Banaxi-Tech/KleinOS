@@ -24,6 +24,8 @@ void hkdf_expand_label(const uint8_t secret[32], const char* label, const uint8_
 // X25519 (RFC 7748)
 void x25519(uint8_t out[32], const uint8_t scalar[32], const uint8_t point[32]);
 void x25519_public(uint8_t pub[32], const uint8_t priv[32]);
+// Ed25519 signature check (RFC 8032).
+bool ed25519_verify(const uint8_t sig[64], const void* msg, size_t n, const uint8_t pub[32]);
 
 // AES-128-GCM (RFC 5116), 12-byte nonce, 16-byte tag appended/verified.
 struct AesGcm {
@@ -33,6 +35,23 @@ struct AesGcm {
     void encrypt(const uint8_t nonce[12], const uint8_t* aad, size_t alen, const uint8_t* in, size_t n, uint8_t* out, uint8_t tag[16]);
     bool decrypt(const uint8_t nonce[12], const uint8_t* aad, size_t alen, const uint8_t* in, size_t n, uint8_t* out, const uint8_t tag[16]);
 };
+
+// AES-128 block operations.
+struct Aes128 {
+    uint32_t rk[44];
+    void init(const uint8_t key[16]);
+    void encrypt(const uint8_t in[16], uint8_t out[16]) const;
+    void decrypt(const uint8_t in[16], uint8_t out[16]) const;
+};
+// WPA2-PSK: passphrase to PMK, PRF-SHA1 key derivation, EAPOL MIC, GTK unwrap.
+void wpa_psk(const char* passphrase, const uint8_t* ssid, size_t ssid_len, uint8_t pmk[32]);
+void prf_sha1(const uint8_t* key, size_t klen, const char* label, const uint8_t* data, size_t dlen, uint8_t* out, size_t olen);
+void hmac_sha1(const uint8_t* key, size_t klen, const uint8_t* msg, size_t mlen, uint8_t out[20]);
+// RFC 3394. n = wrapped length (multiple of 8); out receives n - 8 bytes. False if the check fails.
+bool aes_unwrap(const uint8_t kek[16], const uint8_t* in, size_t n, uint8_t* out);
+// CCMP (AES-CCM, 8-byte MIC, 13-byte nonce). encrypt writes len + 8 bytes; decrypt returns false on a bad MIC.
+void ccmp_encrypt(const Aes128& aes, const uint8_t nonce[13], const uint8_t* aad, size_t alen, const uint8_t* in, size_t len, uint8_t* out);
+bool ccmp_decrypt(const Aes128& aes, const uint8_t nonce[13], const uint8_t* aad, size_t alen, const uint8_t* in, size_t len, uint8_t* out);
 
 void random_bytes(uint8_t* out, size_t n);
 

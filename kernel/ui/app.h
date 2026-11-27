@@ -1,6 +1,6 @@
 #pragma once
 // App registry. Every app lives in apps/<Name>/ and is built into
-// /System/Apps/<Name>.dl; at load time its static AppRegistrar registers it.
+// /System/Apps/<Name>.run; at load time its static AppRegistrar registers it.
 //
 //   static void draw_icon(Canvas& c, Rect r) { icon_base(c, r, hex(0x...), hex(0x...)); ... }
 //   static Window* create() { return new MyWindow(); }
@@ -30,7 +30,7 @@ const AppInfo* app_get(int index);
 const AppInfo* app_find(const char* id);
 // Launch (or focus) an app. Returns the window (or nullptr).
 Window* app_launch(const char* id);
-// Which .dl file registered this app ("Calculator.dl").
+// Which .run file registered this app ("Calculator.run").
 const char* app_module(const char* id);
 void app_set_loading_module(const char* name);   // used by the loader
 

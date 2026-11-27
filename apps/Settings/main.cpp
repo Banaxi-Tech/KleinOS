@@ -1,4 +1,5 @@
 // System Settings: macOS Ventura-style preference panes.
+#include "sys/rdebug.h"
 #include "ui/window.h"
 #include "ui/widgets.h"
 #include "ui/app.h"
@@ -13,6 +14,9 @@
 #include "sys/productkey.h"
 #include "sys/session.h"
 #include "sys/system.h"
+#include "sys/update.h"
+#include "sys/sysconfig.h"
+#include "drivers/power.h"
 #include "sys/dl.h"
 #include "boot/multiboot2.h"
 #include "arch/cpu.h"
@@ -34,7 +38,7 @@ constexpr int kInR = kX1 - 16;       // right edge inside a group
 
 enum PaneId {
     PN_General, PN_Appearance, PN_Wallpaper, PN_Dock, PN_Displays, PN_Network, PN_Keyboard,
-    PN_DateTime, PN_Users, PN_Activation, PN_Update, PN_Storage, PN_About, PN_Count
+    PN_DateTime, PN_Users, PN_Activation, PN_Update, PN_Storage, PN_Debugging, PN_About, PN_Count
 };
 
 struct PaneDef { const char* name; Symbol sym; Color top; Color bottom; };
@@ -51,6 +55,7 @@ const PaneDef kPanes[PN_Count] = {
     {"Activation", Symbol::Lock, hex(0xFFD84A), hex(0xE0A200)},
     {"Software Update", Symbol::Refresh, hex(0xC47CFF), hex(0x7A3ACC)},
     {"Storage", Symbol::Download, hex(0x4CD97A), hex(0x1E8F44)},
+    {"Wi-Fi Debugging", Symbol::Wifi, hex(0xFF9F5A), hex(0xD9541E)},
     {"About", Symbol::Info, hex(0x8E9AAF), hex(0x4A5568)},
 };
 
@@ -336,6 +341,32 @@ public:
         for (int i = 0; i < kZoneCount; i++) timezone->options.push(String(kZones[i].name));
         timezone->on_change = [this](int i) { rtc_set_utc_offset_minutes(kZones[i].minutes); save_prefs(); invalidate(); };
 
+        user_password_btn = (Button*)add_tagged(new Button(Rect(kInR - 170, 368, 170, 30), "Change Password..."), PN_Users, false);
+        user_password_btn->on_click = [this] {
+            editing_password = true;
+            clear_user_passwords();
+            user_password_message = "";
+            sync_visibility();
+            UserAccount* u = current_account();
+            focus_widget(u && u->password_hash[0] ? user_current_pw : user_new_pw);
+            invalidate();
+        };
+        user_current_pw = (TextField*)add_tagged(new TextField(Rect(kInR - 270, 183, 270, 30), "Current password"), PN_Users, false);
+        user_new_pw = (TextField*)add_tagged(new TextField(Rect(kInR - 270, 227, 270, 30), "New password"), PN_Users, false);
+        user_confirm_pw = (TextField*)add_tagged(new TextField(Rect(kInR - 270, 271, 270, 30), "Repeat new password"), PN_Users, false);
+        for (TextField* f : {user_current_pw, user_new_pw, user_confirm_pw}) {
+            f->password = true;
+            f->max_length = 63;
+            f->on_change = [this] { user_password_message = ""; invalidate(); };
+        }
+        user_current_pw->on_submit = [this] { focus_widget(user_new_pw); };
+        user_new_pw->on_submit = [this] { focus_widget(user_confirm_pw); };
+        user_confirm_pw->on_submit = [this] { change_user_password(); };
+        user_password_save = (Button*)add_tagged(new Button(Rect(kInR - 160, 364, 160, 30), "Save Password", Button::Primary), PN_Users, false);
+        user_password_save->on_click = [this] { change_user_password(); };
+        user_password_cancel = (Button*)add_tagged(new Button(Rect(kInR - 260, 364, 90, 30), "Cancel"), PN_Users, false);
+        user_password_cancel->on_click = [this] { close_password_form(); invalidate(); };
+
         key = (TextField*)add_tagged(new TextField(Rect(kInR - 280, 196 + 7, 280, 30), "XXXXX-XXXXX-XXXXX-XXXXX-XXXXX"),
                                      PN_Activation, false);
         key->max_length = 29;
@@ -360,12 +391,28 @@ public:
         autoupd = (Toggle*)add_tagged(new Toggle(Rect(670, 276, 50, kRowH), g_autoupdate), PN_Update, false);
         autoupd->on_change = [this](bool on) { g_autoupdate = on; save_prefs(); invalidate(); };
 
+        debug_toggle = (Toggle*)add_tagged(new Toggle(Rect(670, 80, 50, kRowH), rdebug::enabled()), PN_Debugging, false);
+        debug_toggle->on_change = [this](bool on) {
+            if (on && !rdebug::has_password()) { debug_message = "Set a password first."; debug_toggle->on = false; }
+            else { rdebug::set_enabled(on); debug_message = ""; }
+            invalidate();
+        };
+        debug_pw = (TextField*)add_tagged(new TextField(Rect(kInR - 300, 80 + kRowH + 7, 190, 30), "At least 10 characters"), PN_Debugging, false);
+        debug_pw->password = true;
+        debug_set = (Button*)add_tagged(new Button(Rect(kInR - 100, 80 + kRowH + 7, 100, 30), "Set", Button::Primary), PN_Debugging, false);
+        debug_set->on_click = [this] {
+            if (rdebug::set_password(debug_pw->get_text())) { debug_pw->set_text(""); debug_message = "Password saved."; }
+            else debug_message = "The password needs at least 10 characters.";
+            invalidate();
+        };
+
         rebuild_shown();
         select_pane(PN_General);
         set_ticking(true);
     }
 
     ~SettingsWindow() override {
+        clear_user_passwords();
         for (int i = 0; i < 6; i++) delete thumbs[i];
     }
 
@@ -392,6 +439,7 @@ public:
             case PN_Activation: paint_activation(c); break;
             case PN_Update: paint_update(c); break;
             case PN_Storage: paint_storage(c); break;
+            case PN_Debugging: paint_debugging(c); break;
             case PN_About: paint_about(c); break;
         }
         // Widgets go last so they sit above the grouped boxes.
@@ -448,22 +496,32 @@ public:
             if (g_appearance == 2 && auto_wants_dark() != theme_is_dark()) theme_set_dark(auto_wants_dark());
             if (pane == PN_Network || pane == PN_DateTime || pane == PN_General) invalidate();
         }
-        if (checking) {
-            if (now - check_start >= 2600) {
-                checking = false;
-                DateTime d = rtc_now();
-                check_h = d.hour;
-                check_m = d.minute;
-                checked_once = true;
-                sync_values();
-            }
-            invalidate();
+        update::State us = update::state();
+        int up = update::progress();
+        if (us != last_update_state || up != last_update_progress) {
+            last_update_state = us;
+            last_update_progress = up;
+            sync_values();
+            if (pane == PN_Update) invalidate();
         }
     }
 
 private:
     // ----- state
     int pane = PN_General;
+    Toggle* debug_toggle = nullptr;
+    TextField* debug_pw = nullptr;
+    Button* debug_set = nullptr;
+    String debug_message;
+    Button* user_password_btn = nullptr;
+    TextField* user_current_pw = nullptr;
+    TextField* user_new_pw = nullptr;
+    TextField* user_confirm_pw = nullptr;
+    Button* user_password_save = nullptr;
+    Button* user_password_cancel = nullptr;
+    bool editing_password = false;
+    bool user_password_saved = false;
+    String user_password_message;
     Vector<int> shown;
     TextField* search = nullptr;
     Slider* glass = nullptr;
@@ -478,10 +536,8 @@ private:
     Toggle* autoupd = nullptr;
     Canvas* thumbs[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
     uint64_t last_sec = 0;
-    bool checking = false;
-    uint64_t check_start = 0;
-    bool checked_once = false;
-    int check_h = 0, check_m = 0;
+    update::State last_update_state = update::State::Unsupported;
+    int last_update_progress = -1;
     bool activated = false;
     productkey::KeyInfo info{productkey::Edition::Invalid, productkey::Channel::Retail, 0};
     String key_text;
@@ -530,9 +586,11 @@ private:
     }
 
     void start_check() {
-        if (checking) return;
-        checking = true;
-        check_start = timer_ms();
+        switch (update::state()) {
+            case update::State::Available: update::install(); break;
+            case update::State::Ready: userdata_save_now(); power_reboot();
+            default: update::check(); break;
+        }
         sync_values();
         invalidate();
     }
@@ -545,6 +603,7 @@ private:
     }
 
     void select_pane(int p) {
+        if (pane == PN_Users && p != PN_Users) close_password_form();
         pane = p;
         focus_widget(nullptr);
         sync_values();
@@ -556,8 +615,62 @@ private:
         for (Widget* w : widgets()) {
             bool v = w->tag == -1 || w->tag == pane;
             if (w == key || w == activate_btn) v = v && !activated;
+            if (w == user_password_btn) v = v && !editing_password && current_account();
+            if (w == user_current_pw || w == user_new_pw || w == user_confirm_pw ||
+                w == user_password_save || w == user_password_cancel) v = v && editing_password;
             w->visible = v;
         }
+        UserAccount* u = current_account();
+        user_current_pw->enabled = u && u->password_hash[0];
+        user_current_pw->placeholder = user_current_pw->enabled ? "Current password" : "No password set";
+        user_password_btn->text = u && u->password_hash[0] ? "Change Password..." : "Set Password...";
+    }
+
+    UserAccount* current_account() {
+        if (!sysconfig_present()) return nullptr;
+        SysConfig& cfg = sysconfig();
+        for (uint32_t i = 0; i < cfg.user_count && i < 4; i++)
+            if (!strcmp(cfg.users[i].login, session_user())) return &cfg.users[i];
+        return nullptr;
+    }
+
+    void clear_user_passwords() {
+        for (TextField* f : {user_current_pw, user_new_pw, user_confirm_pw}) {
+            memset(f->text.data(), 0, f->text.size());
+            f->set_text("");
+        }
+    }
+
+    void close_password_form() {
+        focus_widget(nullptr);
+        clear_user_passwords();
+        editing_password = false;
+        user_password_message = "";
+        sync_visibility();
+    }
+
+    void change_user_password() {
+        user_password_saved = false;
+        if (strcmp(user_new_pw->get_text(), user_confirm_pw->get_text())) {
+            user_password_message = "The new passwords don't match.";
+            focus_widget(user_confirm_pw);
+        } else {
+            PasswordChangeResult result = sysconfig_change_password(session_user(), user_current_pw->get_text(), user_new_pw->get_text());
+            if (result == PasswordChangeResult::Saved) {
+                bool removed = !*user_new_pw->get_text();
+                close_password_form();
+                user_password_saved = true;
+                user_password_message = removed ? "Password removed." : "Password saved.";
+            } else if (result == PasswordChangeResult::IncorrectPassword) {
+                user_password_message = "The current password is incorrect.";
+                focus_widget(user_current_pw);
+            } else {
+                user_password_message = result == PasswordChangeResult::SaveFailed
+                    ? "Could not save the password. Please try again."
+                    : "Password changes require an installed account.";
+            }
+        }
+        invalidate();
     }
 
     void sync_values() {
@@ -567,8 +680,14 @@ private:
         layout->selected = (int)input_layout();
         timezone->selected = zone_index_for(rtc_utc_offset_minutes());
         autoupd->on = g_autoupdate;
-        check_btn->enabled = !checking;
-        check_btn->text = checking ? "Checking..." : "Check for Updates";
+        update::State us = update::state();
+        bool busy = us == update::State::Checking || us == update::State::Downloading || us == update::State::Verifying ||
+                    us == update::State::Installing;
+        check_btn->enabled = !busy && us != update::State::Unsupported;
+        check_btn->text = us == update::State::Available ? "Download and Install"
+                          : us == update::State::Ready   ? "Restart Now"
+                          : busy                         ? "Working..."
+                                                         : "Check for Updates";
         activate_btn->enabled = !activated;
     }
 
@@ -833,13 +952,25 @@ private:
         c.draw_text(kX0 + 84, 92, session_full_name(), t.text, 18, Font::Bold);
         c.draw_text(kX0 + 84, 118, "KleinOS Account", t.text_secondary, 13);
 
-        group(c, 176, 4);
-        char home[64];
-        snprintf(home, sizeof(home), "/Users/%s", session_user());
-        row_title(c, 176, 0, "Full name");     row_value(c, 176, 0, session_full_name());
-        row_title(c, 176, 1, "Account name");  row_value(c, 176, 1, session_user());
-        row_title(c, 176, 2, "Home folder");   row_value(c, 176, 2, home);
-        row_title(c, 176, 3, "Account type");  row_value(c, 176, 3, "Administrator");
+        if (editing_password) {
+            group(c, 176, 3);
+            row_title(c, 176, 0, "Current password");
+            row_title(c, 176, 1, "New password");
+            row_title(c, 176, 2, "Confirm password");
+            c.draw_text(kX0, 324, "Leave the new password blank to remove it.", t.text_secondary, 13);
+        } else {
+            group(c, 176, 4);
+            char home[64];
+            snprintf(home, sizeof(home), "/Users/%s", session_user());
+            row_title(c, 176, 0, "Full name");     row_value(c, 176, 0, session_full_name());
+            row_title(c, 176, 1, "Account name");  row_value(c, 176, 1, session_user());
+            row_title(c, 176, 2, "Home folder");   row_value(c, 176, 2, home);
+            UserAccount* u = current_account();
+            row_title(c, 176, 3, "Account type");  row_value(c, 176, 3, u ? (u->is_admin ? "Administrator" : "Standard") : "Guest");
+            if (!u) c.draw_text(kX0, 378, "Password changes require an installed account.", t.text_secondary, 13);
+        }
+        if (!user_password_message.empty())
+            c.draw_text(kX0, 414, user_password_message.c_str(), user_password_saved ? t.success : t.destructive, 13);
     }
 
     void paint_activation(Canvas& c) {
@@ -882,34 +1013,82 @@ private:
         }
     }
 
+    void paint_debugging(Canvas& c) {
+        const Theme& t = theme();
+        pane_title(c, "Wi-Fi Debugging", "Debug and update this computer from another one on your network");
+        draw_group_box(c, Rect(kX0, 80, kW, kRowH * 2));
+        c.draw_text_in(Rect(kX0 + 16, 80, 300, kRowH), "Allow Wi-Fi Debugging", t.text, 14);
+        c.draw_text_in(Rect(kX0 + 16, 80 + kRowH, 150, kRowH), rdebug::has_password() ? "Change password" : "Password", t.text, 14);
+        char line[96];
+        if (rdebug::peer()) snprintf(line, sizeof(line), "Debugger connected from %s", rdebug::peer());
+        else if (rdebug::enabled() && net::is_up()) snprintf(line, sizeof(line), "Waiting at %s, port %d", net::ip_string(), (int)rdebug::kPort);
+        else snprintf(line, sizeof(line), "%s", rdebug::enabled() ? "Waiting for a network" : "Off");
+        c.draw_text_in(Rect(kX0, 80 + kRowH * 2 + 12, kW, 20), line, t.text, 13, Font::Medium);
+        if (!debug_message.empty()) c.draw_text_in(Rect(kX0, 80 + kRowH * 2 + 34, kW, 20), debug_message.c_str(), t.accent, 13);
+        c.draw_text_in(Rect(kX0, 80 + kRowH * 2 + 62, kW, 20), "Anyone with this password on your network has full control of this", hex(0xD9541E), 13);
+        c.draw_text_in(Rect(kX0, 80 + kRowH * 2 + 82, kW, 20), "computer, including its files and saved passwords. Turn it off when done.", hex(0xD9541E), 13);
+    }
+
     void paint_update(Canvas& c) {
         const Theme& t = theme();
-        pane_title(c, "Software Update", "KleinOS 1.0 Aurora");
+        char version[64];
+        snprintf(version, sizeof(version), "%s.%d", KLEIN_VERSION, system_build_number());
+        pane_title(c, "Software Update", system_version_string());
         draw_group_box(c, Rect(kX0, 80, kW, 176));
         int cx = kX0 + kW / 2, cy = 118;
-        if (checking) {
+        update::State us = update::state();
+        bool busy = us == update::State::Checking || us == update::State::Downloading || us == update::State::Verifying ||
+                    us == update::State::Installing;
+        char head[96], sub[120];
+        sub[0] = 0;
+        switch (us) {
+            case update::State::Unsupported:
+                snprintf(head, sizeof(head), "KleinOS %s", version);
+                strlcpy(sub, "Updates need an installed system with update slots.", sizeof(sub));
+                break;
+            case update::State::Checking: strlcpy(head, "Checking for updates...", sizeof(head)); break;
+            case update::State::Available:
+                snprintf(head, sizeof(head), "KleinOS %s is available", update::latest_version());
+                snprintf(sub, sizeof(sub), "You have %s", version);
+                break;
+            case update::State::Downloading:
+                snprintf(head, sizeof(head), "Downloading KleinOS %s", update::latest_version());
+                snprintf(sub, sizeof(sub), "%d%%", update::progress());
+                break;
+            case update::State::Verifying: strlcpy(head, "Verifying the update...", sizeof(head)); break;
+            case update::State::Installing:
+                strlcpy(head, "Installing the update...", sizeof(head));
+                snprintf(sub, sizeof(sub), "%d%%", update::progress());
+                break;
+            case update::State::Ready:
+                snprintf(head, sizeof(head), "KleinOS %s is ready", update::latest_version());
+                strlcpy(sub, "Restart to finish installing.", sizeof(sub));
+                break;
+            case update::State::Failed:
+                strlcpy(head, "Update failed", sizeof(head));
+                strlcpy(sub, update::error(), sizeof(sub));
+                break;
+            default:
+                snprintf(head, sizeof(head), "KleinOS %s is up to date", version);
+                if (us == update::State::Idle) strlcpy(head, "Check to see if there is a new version", sizeof(head));
+                break;
+        }
+        if (busy) {
             c.fill_arc(cx, cy, 24, 18, 0, 6.2831853f, rgba(128, 128, 128, 60));
             float ph = (float)((timer_ms() % 900) / 900.0 * 6.2831853);
             c.fill_arc(cx, cy, 24, 18, ph, ph + 1.6f, t.accent);
-            c.draw_text_in(Rect(kX0, 152, kW, 22), "Checking for updates...", t.text, 16, Font::Bold, Align::Center);
-            c.draw_text_in(Rect(kX0, 176, kW, 16), "This only takes a moment.", t.text_secondary, 12, Font::Regular,
-                           Align::Center);
+            invalidate();
         } else {
-            c.fill_circle(cx, cy, 24, t.success);
+            c.fill_circle(cx, cy, 24, us == update::State::Failed ? t.destructive : t.success);
             draw_symbol(c, Rect(cx - 12, cy - 12, 24, 24), Symbol::Check, hex(0xFFFFFF), 2.8f);
-            c.draw_text_in(Rect(kX0, 152, kW, 22), "KleinOS 1.0 is up to date", t.text, 16, Font::Bold, Align::Center);
-            char sub[96];
-            if (checked_once) snprintf(sub, sizeof(sub), "Last checked today at %02d:%02d", check_h, check_m);
-            else snprintf(sub, sizeof(sub), "%s.%d is the latest release for this channel", KLEIN_VERSION, system_build_number());
-            c.draw_text_in(Rect(kX0, 176, kW, 16), sub, t.text_secondary, 12, Font::Regular, Align::Center);
         }
+        c.draw_text_in(Rect(kX0, 152, kW, 22), head, t.text, 16, Font::Bold, Align::Center);
+        c.draw_text_in(Rect(kX0, 176, kW, 16), sub, t.text_secondary, 12, Font::Regular, Align::Center);
 
         group(c, 276, 2);
         row_title(c, 276, 0, "Install updates automatically");
         row_title(c, 276, 1, "Installed version");
-        char build[64];
-        snprintf(build, sizeof(build), "%s.%d", KLEIN_VERSION, system_build_number());
-        row_value(c, 276, 1, build);
+        row_value(c, 276, 1, version);
     }
 
     void paint_storage(Canvas& c) {
@@ -981,7 +1160,7 @@ private:
         uint64_t s = timer_ms() / 1000;
         snprintf(up, sizeof(up), "%lluh %02llum %02llus", (unsigned long long)(s / 3600),
                  (unsigned long long)(s / 60 % 60), (unsigned long long)(s % 60));
-        snprintf(mods, sizeof(mods), "%zu .dl modules, %d apps", dl_modules().size(), app_count());
+        snprintf(mods, sizeof(mods), "%zu modules, %d apps", dl_modules().size(), app_count());
         group(c, 176, 6);
         row_title(c, 176, 0, "Processor");   row_value(c, 176, 0, cpu_brand());
         row_title(c, 176, 1, "Memory");      row_value(c, 176, 1, mem);

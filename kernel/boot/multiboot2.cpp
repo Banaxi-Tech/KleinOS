@@ -6,9 +6,6 @@
 
 extern "C" char __kernel_end[];
 
-static BootInfo g_boot;
-BootInfo& boot_info() { return g_boot; }
-
 struct Tag { uint32_t type, size; };
 
 void multiboot2_parse(uint32_t magic, uintptr_t info, BootInfo& out) {
@@ -25,6 +22,13 @@ void multiboot2_parse(uint32_t magic, uintptr_t info, BootInfo& out) {
         Tag* t = (Tag*)p;
         if (t->type == 0) break;
         switch (t->type) {
+        case 14: case 15: {   // ACPI RSDP (old, new)
+            static uint8_t rsdp[64];
+            uint32_t n = t->size - 8 < sizeof(rsdp) ? t->size - 8 : sizeof(rsdp);
+            memcpy(rsdp, (const uint8_t*)t + 8, n);
+            out.acpi_rsdp = (uintptr_t)rsdp;
+            break;
+        }
         case 1:   // cmdline
             out.cmdline = (const char*)(p + 8);
             break;
@@ -75,29 +79,4 @@ void multiboot2_parse(uint32_t magic, uintptr_t info, BootInfo& out) {
     }
 }
 
-const BootModule* boot_module(const char* name) {
-    for (int i = 0; i < g_boot.module_count; i++)
-        if (strcmp(g_boot.modules[i].name, name) == 0) return &g_boot.modules[i];
-    return nullptr;
-}
-
-bool boot_arg(const char* key, char* value, size_t size) {
-    size_t klen = strlen(key);
-    const char* s = g_boot.cmdline;
-    while (s && *s) {
-        while (*s == ' ') s++;
-        if (strncmp(s, key, klen) == 0 && s[klen] == '=') {
-            s += klen + 1;
-            size_t n = 0;
-            while (s[n] && s[n] != ' ') n++;
-            if (value && size) {
-                size_t c = n < size - 1 ? n : size - 1;
-                memcpy(value, s, c);
-                value[c] = 0;
-            }
-            return true;
-        }
-        while (*s && *s != ' ') s++;
-    }
-    return false;
-}
+void boot_parse(uint32_t magic, uintptr_t info, BootInfo& out) { multiboot2_parse(magic, info, out); }

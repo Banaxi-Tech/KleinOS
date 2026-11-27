@@ -1,4 +1,5 @@
 #include "drivers/ata.h"
+#include "drivers/usb_storage.h"
 #include "arch/cpu.h"
 #include "lib/log.h"
 #include "lib/string.h"
@@ -100,6 +101,7 @@ static bool setup(AtaDrive& d, uint64_t lba, uint32_t count, bool ext) {
 }
 
 bool ata_read(int drive, uint64_t lba, uint32_t count, void* buf) {
+    if (drive == kUsbDrive) return usb_storage_read(lba, count, buf);
     AtaDrive* d = ata_drive(drive);
     if (!d || !d->present || d->atapi) return false;
     uint8_t* p = (uint8_t*)buf;
@@ -121,6 +123,7 @@ bool ata_read(int drive, uint64_t lba, uint32_t count, void* buf) {
 }
 
 bool ata_write(int drive, uint64_t lba, uint32_t count, const void* buf) {
+    if (drive == kUsbDrive) return usb_storage_write(lba, count, buf);
     AtaDrive* d = ata_drive(drive);
     if (!d || !d->present || d->atapi) return false;
     const uint8_t* p = (const uint8_t*)buf;
@@ -142,6 +145,7 @@ bool ata_write(int drive, uint64_t lba, uint32_t count, const void* buf) {
 }
 
 bool ata_flush(int drive) {
+    if (drive == kUsbDrive) return usb_storage_flush();
     AtaDrive* d = ata_drive(drive);
     if (!d || !d->present) return false;
     if (!wait_ready(*d)) return false;

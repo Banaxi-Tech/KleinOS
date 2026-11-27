@@ -6,7 +6,46 @@
 
 namespace {
 
-Vector<const PciDevice*> g_claimed;
+struct Binding {
+    const PciDevice* dev;
+    const char* name;
+    bool fallback;
+};
+struct Fallback {
+    const DriverInfo* info;
+    const DriverFallback* match;
+};
+
+Vector<Binding> g_bindings;
+Vector<Fallback> g_fallbacks;
+
+Binding* binding_of(const PciDevice* d) {
+    for (Binding& b : g_bindings)
+        if (b.dev == d) return &b;
+    return nullptr;
+}
+
+void bind(const DriverInfo* info, const PciDevice* d, bool fallback) {
+    Binding* b = binding_of(d);
+    if (b) { b->name = info->name; b->fallback = fallback; }
+    else g_bindings.push({d, info->name, fallback});
+    klog("driver: %s bound to %04x:%04x", info->name, d->vendor, d->device);
+}
+
+// the e1000 in net/stack.cpp starts after the drivers and is not one of them
+bool is_builtin_nic(const PciDevice* d) {
+    return d->vendor == 0x8086 && (d->device == 0x100E || d->device == 0x100F || d->device == 0x10D3);
+}
+
+void bind_fallbacks() {
+    for (Fallback& f : g_fallbacks)
+        for (int i = 0; i < pci_count(); i++) {
+            const PciDevice* d = pci_get(i);
+            if (binding_of(d) || is_builtin_nic(d) || d->class_code != f.match->class_code) continue;
+            if (f.match->subclass != kPciAnySubclass && d->subclass != f.match->subclass) continue;
+            if (f.info->probe(d)) bind(f.info, d, true);
+        }
+}
 
 bool id_matches(const DriverInfo* info, const PciDevice* d) {
     for (int i = 0; i < info->id_count; i++)
@@ -15,6 +54,17 @@ bool id_matches(const DriverInfo* info, const PciDevice* d) {
 }
 
 }  // namespace
+
+const char* driver_for_device(const PciDevice* d) {
+    Binding* b = binding_of(d);
+    if (b) return b->name;
+    return is_builtin_nic(d) ? "Intel PRO/1000 (built in)" : nullptr;
+}
+
+bool driver_is_fallback(const PciDevice* d) {
+    Binding* b = binding_of(d);
+    return b && b->fallback;
+}
 
 bool driver_load(const char* path, String* error) {
     auto fail = [&](const char* msg) {
@@ -28,14 +78,19 @@ bool driver_load(const char* path, String* error) {
     if (!info) return fail("no klein_driver symbol");
     if (info->abi != KLEIN_DRIVER_ABI) return fail("built for a different driver ABI");
     if (!info->name || !info->probe || (info->id_count && !info->ids)) return fail("incomplete DriverInfo");
+    if (auto* match = (const DriverFallback*)dl_sym(m, "klein_driver_fallback")) {
+        g_fallbacks.push({info, match});
+        klog("driver: %s loaded as a fallback", info->name);
+        return true;
+    }
     int bound = 0;
     for (int i = 0; i < pci_count(); i++) {
         const PciDevice* d = pci_get(i);
-        if (g_claimed.contains(d) || !id_matches(info, d)) continue;
+        Binding* b = binding_of(d);
+        if ((b && !b->fallback) || !id_matches(info, d)) continue;
         if (!info->probe(d)) continue;
-        g_claimed.push(d);
+        bind(info, d, false);
         bound++;
-        klog("driver: %s bound to %04x:%04x", info->name, d->vendor, d->device);
     }
     klog("driver: %s loaded, %d device(s)", info->name, bound);
     return true;
@@ -54,5 +109,6 @@ int driver_load_dir(const char* dir) {
     int n = 0;
     for (String& name : names)
         if (driver_load(vfs::join(dir, name.c_str()).c_str())) n++;
+    bind_fallbacks();
     return n;
 }

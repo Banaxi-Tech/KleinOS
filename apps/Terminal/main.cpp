@@ -101,7 +101,7 @@ constexpr HelpEntry kCommands[] = {
     {"free", "memory usage"},
     {"df", "storage devices"},
     {"lspci", "PCI devices"},
-    {"lsdl", "loaded .dl modules"},
+    {"lsdl", "loaded .dl and .run modules"},
     {"apps", "installed applications"},
     {"open", "open an app id or a path"},
     {"ps", "open windows"},
@@ -786,7 +786,7 @@ private:
 
     static uint8_t entry_style(const vfs::Node* n) {
         if (n->is_dir) return S_BLUE;
-        if (n->name.ends_with(".dl")) return S_GREEN;
+        if (n->name.ends_with(".dl") || n->name.ends_with(".run")) return S_GREEN;
         return S_DEF;
     }
 

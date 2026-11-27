@@ -98,7 +98,7 @@ Document::~Document() {
     free_rules(this);
     free_node(root);
     for (Node* o : orphans) if (!o->parent) free_node(o);
-    for (Image& im : images) delete im.canvas;
+    for (Image& im : images) { delete im.canvas; delete im.scaled; }
     for (Canvas* c : inline_svgs) delete c;
 }
 

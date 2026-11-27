@@ -22,6 +22,18 @@ struct DriverInfo {
     bool (*probe)(const PciDevice* dev);   // true = device claimed
 };
 
+// Optional second export, klein_driver_fallback: the driver takes any device of
+// this class that nothing else claimed. Fallbacks bind after every other driver
+// has loaded, and a real driver loaded later replaces them.
+constexpr uint8_t kPciAnySubclass = 0xFF;
+struct DriverFallback {
+    uint8_t class_code, subclass;
+};
+
+// Name of the driver bound to a device, or nullptr.
+const char* driver_for_device(const PciDevice* d);
+bool driver_is_fallback(const PciDevice* d);
+
 // Load one .dri and bind it to matching PCI devices. Returns false if it could not be loaded.
 bool driver_load(const char* path, String* error = nullptr);
 // Load every .dri in a directory (sorted by name). Returns number loaded.

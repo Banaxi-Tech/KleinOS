@@ -1,5 +1,5 @@
 #pragma once
-// .dl dynamic libraries: ELF64 shared objects (x86-64) loaded at runtime and
+// .dl libraries and .run apps: ELF64 shared objects (x86-64) loaded at runtime and
 // linked against the kernel's exported symbols (/System/kernel.sym) and
 // previously loaded libraries in /System/Libraries.
 #include <stdint.h>
@@ -8,8 +8,8 @@
 #include "lib/vector.h"
 
 struct DlModule {
-    String name;        // "Calculator.dl"
-    String path;        // "/System/Apps/Calculator.dl"
+    String name;        // "Calculator.run"
+    String path;        // "/System/Apps/Calculator.run"
     uint8_t* base = nullptr;
     size_t mem_size = 0;
     size_t file_size = 0;
@@ -24,10 +24,11 @@ struct DlModule {
 
 // Parse /System/kernel.sym. Must run before any dl_open.
 bool dl_init();
-// Load a .dl file; runs its constructors (apps register themselves there).
+// Load a .dl or .run file; runs its constructors (apps register themselves there).
 DlModule* dl_open(const char* path, bool is_library = false, String* error = nullptr);
 void* dl_sym(DlModule* m, const char* name);
-// Load every .dl in a directory (sorted by name). Returns number loaded.
+// Load every library (.dl) or app (.run) in a directory, sorted by name.
+// Returns number loaded.
 int dl_load_dir(const char* dir, bool libraries);
 const Vector<DlModule*>& dl_modules();
 // Address of a kernel symbol (mangled name), or nullptr.

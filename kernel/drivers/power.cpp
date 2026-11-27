@@ -3,6 +3,44 @@
 #include "arch/interrupts.h"
 #include "lib/log.h"
 
+#if defined(__aarch64__)
+#include "boot/dtb.h"
+#include "lib/string.h"
+
+// PSCI (Power State Coordination Interface) through HVC or SMC, whichever the device tree names.
+static bool psci_uses_smc() {
+    DtbNode n;
+    if (dtb_find_compatible("arm,psci-1.0", 0, &n) || dtb_find_compatible("arm,psci-0.2", 0, &n) ||
+        dtb_find_compatible("arm,psci", 0, &n))
+        return n.method && !strcmp(n.method, "smc");
+    return false;
+}
+
+static void psci_call(uint32_t fn) {
+    register uint64_t x0 asm("x0") = fn;
+    if (psci_uses_smc()) asm volatile("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
+    else asm volatile("hvc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
+}
+
+[[noreturn]] void power_reboot() {
+    klog("power: reboot");
+    cli();
+    psci_call(0x84000009);     // SYSTEM_RESET
+    for (;;) hlt();
+}
+
+[[noreturn]] void power_shutdown() {
+    klog("power: shutdown");
+    cli();
+    psci_call(0x84000008);     // SYSTEM_OFF
+    for (;;) hlt();
+}
+
+// No PC speaker on ARM boards.
+void speaker_tone(uint32_t) {}
+void speaker_beep(uint32_t, uint32_t) {}
+void speaker_tick() {}
+#else
 [[noreturn]] void power_reboot() {
     klog("power: reboot");
     cli();
@@ -53,3 +91,4 @@ void speaker_tick() {
         g_beep_end = 0;
     }
 }
+#endif

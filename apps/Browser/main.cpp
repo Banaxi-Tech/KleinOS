@@ -92,6 +92,19 @@ struct Frame {
 const char kFrameBlocked[] = "<html><body style=\"font:13px sans-serif;color:#777;text-align:center;padding:16px\">This content can't be shown in a frame.</body></html>";
 const char kFrameFailed[] = "<html><body style=\"font:13px sans-serif;color:#777;text-align:center;padding:16px\">This content could not be loaded.</body></html>";
 
+// The server's type wins: "photo.svg.png" is a PNG, however it is named.
+static bool response_is_svg(const html::Image& im, const char* ct, const uint8_t* body, size_t len) {
+    if (ct && !strncmp(ct, "image/", 6)) return strstr(ct, "svg") != nullptr;
+    return im.svg || (len > 5 && memmem_s(body, len, "<svg") != nullptr);
+}
+
+static bool contains_text(const uint8_t* hay, size_t n, const char* needle) {
+    size_t m = strlen(needle);
+    for (size_t i = 0; i + m <= n; i++)
+        if (!memcmp(hay + i, needle, m)) return true;
+    return false;
+}
+
 class BrowserWindow : public Window {
 public:
     BrowserWindow() : Window("Voyager", 1040, 680) {
@@ -200,6 +213,10 @@ public:
         const char* hash = strchr(url, '#');
         if (hash) { int y = html::anchor_y(doc_, hash + 1); if (y >= 0) scroll_ = y; }
         for (String& css : doc_->stylesheet_urls) pending_.push(Pending{net::http_get(css.c_str()), css, 2});
+        // like other browsers, show nothing until the page's CSS is here (or is clearly late)
+        css_hold_ = !doc_->stylesheet_urls.empty();
+        css_hold_until_ = timer_ms() + kCssHoldMs;
+        image_layout_ = false;
         invalidate();
     }
 
@@ -208,6 +225,8 @@ public:
         doc_->viewport_w = kmax(200, width() - 12);
         doc_->viewport_h = view_h();
         html::layout(doc_, kmax(200, width() - 12));
+        last_layout_ = timer_ms();
+        image_layout_ = false;
         int maxs = kmax(0, doc_->height - view_h());
         scroll_ = kclamp(scroll_, 0, maxs);
         need_images_ = true;
@@ -452,7 +471,7 @@ public:
                 if (target && st != net::HttpState::Done && target->retries < 2) { target->retries++; target->requested = false; }
                 else if (target) {
                     const char* ct = net::http_header(p.req, "content-type");
-                    bool is_svg = target->svg || (ct && strstr(ct, "svg")) || (len > 5 && memmem_s(body, len, "<svg") != nullptr);
+                    bool is_svg = response_is_svg(*target, ct, body, len);
                     target->canvas = body ? decode_image(*target, body, len, is_svg) : nullptr;
                     target->failed = !target->canvas;
                     relayout_needed |= target->canvas != nullptr;
@@ -676,6 +695,8 @@ public:
     }
 
     Canvas* decode_image(html::Image& im, const uint8_t* body, size_t len, bool is_svg) {
+        // film-grain textures: without the filter the renderer would paint a solid block
+        if (is_svg && contains_text(body, len, "feTurbulence")) return nullptr;
 #ifdef HAVE_SVG
         if (is_svg) {
             int w = im.want_w > 1 ? im.want_w : 0, h = im.want_h > 1 ? im.want_h : 0;
@@ -799,7 +820,7 @@ public:
                     size_t len;
                     const uint8_t* body = net::http_body(done.req, &len);
                     const char* ct = net::http_header(done.req, "content-type");
-                    bool is_svg = target->svg || (ct && strstr(ct, "svg")) || (len > 5 && (memmem_s(body, len, "<svg") != nullptr));
+                    bool is_svg = response_is_svg(*target, ct, body, len);
                     img = decode_image(*target, body, len, is_svg);
                 }
                 if (target && st != net::HttpState::Done && target->retries < 2) {
@@ -807,7 +828,7 @@ public:
                     target->retries++;
                     target->requested = false;
                 } else if (target) { target->canvas = img; target->failed = !img; }
-                if (img) relayout_needed = true;
+                if (img) image_layout_ = true;
                 need_images_ = true;
             } else if (done.kind == 3 && js_) {
                 Vector<html::ScriptInfo>& sc = html::js_scripts(js_);
@@ -828,10 +849,17 @@ public:
                 size_t len;
                 const uint8_t* body = net::http_body(done.req, &len);
                 html::add_stylesheet(doc_, (const char*)body, len);
-                relayout_needed = true;
+                relayout_needed = !css_hold_;
             }
             net::http_free(done.req);
         }
+        if (css_hold_) {
+            bool waiting = false;
+            for (Pending& p : pending_) if (p.kind == 2) waiting = true;
+            if (!waiting || timer_ms() >= css_hold_until_) { css_hold_ = false; relayout_needed = true; }
+        }
+        // a full layout per image is what made pages crawl while they loaded
+        if (image_layout_ && !css_hold_ && timer_ms() - last_layout_ >= kImageLayoutMs) relayout_needed = true;
         if (js_) changed |= pump_js(relayout_needed);
         changed |= pump_frames();
         if (relayout_needed) { relayout(); changed = true; }
@@ -852,7 +880,7 @@ public:
     void on_paint(Canvas& c) override {
         const Theme& t = theme();
         // page
-        if (doc_) {
+        if (doc_ && !css_hold_) {
             Canvas view(c.row(kToolbar), width(), view_h(), c.stride());
             html::paint(doc_, view, scroll_);
             // scrollbar
@@ -1130,6 +1158,9 @@ public:
     int scroll_ = 0;
     bool loading_ = false;
     bool need_images_ = false;
+    static constexpr uint64_t kCssHoldMs = 8000, kImageLayoutMs = 300;
+    bool css_hold_ = false, image_layout_ = false;
+    uint64_t css_hold_until_ = 0, last_layout_ = 0;
     float progress_ = 0;
 };
 

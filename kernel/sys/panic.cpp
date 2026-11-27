@@ -25,6 +25,13 @@ static void put_text(int x, int y, const char* s, uint32_t color, int scale) {
     }
 }
 
+// Where kernel stacks can live, to keep the frame-pointer walk from chasing garbage.
+#if defined(__aarch64__)
+static constexpr uintptr_t kStackLo = 0x40000000ull, kStackHi = 0x8000000000ull;
+#else
+static constexpr uintptr_t kStackLo = 0x100000, kStackHi = 0x100000000ull;
+#endif
+
 [[noreturn]] static void panic_screen(const char* msg, const char* detail1, const char* detail2) {
     cli();
     FramebufferInfo& fb = framebuffer();
@@ -49,7 +56,7 @@ static void put_text(int x, int y, const char* s, uint32_t color, int scale) {
     void** rbp = (void**)__builtin_frame_address(0);
     char trace[256];
     int n = snprintf(trace, sizeof(trace), "trace:");
-    for (int i = 0; i < 8 && rbp && (uintptr_t)rbp > 0x100000 && (uintptr_t)rbp < 0x100000000ull; i++) {
+    for (int i = 0; i < 8 && rbp && (uintptr_t)rbp > kStackLo && (uintptr_t)rbp < kStackHi; i++) {
         n += snprintf(trace + n, sizeof(trace) - n, " %p", rbp[1]);
         rbp = (void**)rbp[0];
     }
@@ -59,6 +66,17 @@ static void put_text(int x, int y, const char* s, uint32_t color, int scale) {
 
 [[noreturn]] void kpanic_frame(const char* msg, InterruptFrame* f, uint64_t cr2) {
     char d1[200], d2[200];
+#if defined(__aarch64__)
+    snprintf(d1, sizeof(d1), "PC=%p  ESR=%llx  FAR=%p  SP=%p  LR=%p", (void*)f->pc, (unsigned long long)f->esr,
+             (void*)cr2, (void*)f->sp, (void*)f->x[30]);
+    snprintf(d2, sizeof(d2), "X0=%llx X1=%llx X2=%llx X3=%llx X4=%llx X5=%llx",
+             (unsigned long long)f->x[0], (unsigned long long)f->x[1], (unsigned long long)f->x[2],
+             (unsigned long long)f->x[3], (unsigned long long)f->x[4], (unsigned long long)f->x[5]);
+    klog("EXCEPTION: %s  %s", msg, d1);
+    klog("%s", d2);
+    klog("  frame 0: %p", (void*)f->pc);
+    void** rbp = (void**)f->x[29];
+#else
     snprintf(d1, sizeof(d1), "RIP=%p  ERR=%llx  CR2=%p  RSP=%p", (void*)f->rip,
              (unsigned long long)f->error, (void*)cr2, (void*)f->rsp);
     snprintf(d2, sizeof(d2), "RAX=%llx RBX=%llx RCX=%llx RDX=%llx RSI=%llx RDI=%llx",
@@ -67,8 +85,9 @@ static void put_text(int x, int y, const char* s, uint32_t color, int scale) {
     klog("EXCEPTION: %s  %s", msg, d1);
     klog("%s", d2);
     void** rbp = (void**)f->rbp;
-    for (int i = 0; i < 10 && rbp && (uintptr_t)rbp > 0x100000 && (uintptr_t)rbp < 0x100000000ull; i++) {
-        klog("  frame %d: %p", i, rbp[1]);
+#endif
+    for (int i = 0; i < 10 && rbp && (uintptr_t)rbp > kStackLo && (uintptr_t)rbp < kStackHi; i++) {
+        klog("  frame %d: %p", i + 1, rbp[1]);
         rbp = (void**)rbp[0];
     }
     panic_screen(msg, d1, d2);

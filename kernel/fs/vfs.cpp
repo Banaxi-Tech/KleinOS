@@ -125,6 +125,7 @@ static void set_data(Node* n, const void* data, size_t size) {
     n->size = size;
     n->readonly = false;
     n->mtime = rtc_unix_time();
+    n->unsaved = true;
 }
 
 bool write_file(const char* path, const void* data, size_t size) {
@@ -151,6 +152,7 @@ bool append_file(const char* path, const void* data, size_t size) {
     memcpy(n->data + n->size, data, size);
     n->size += size;
     n->mtime = rtc_unix_time();
+    n->unsaved = true;
     changed(n);
     return true;
 }

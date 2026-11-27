@@ -3,6 +3,47 @@
 
 extern "C" {
 
+#if defined(__aarch64__)
+// Unaligned 64-bit access without relying on the compiler's own memcpy (this file is built -fno-builtin).
+typedef uint64_t __attribute__((may_alias, aligned(1))) u64u;
+
+void* memcpy(void* dst, const void* src, size_t n) {
+    uint8_t* d = (uint8_t*)dst;
+    const uint8_t* s = (const uint8_t*)src;
+    while (n >= 32) {
+        u64u a = ((const u64u*)s)[0], b = ((const u64u*)s)[1], c = ((const u64u*)s)[2], e = ((const u64u*)s)[3];
+        ((u64u*)d)[0] = a; ((u64u*)d)[1] = b; ((u64u*)d)[2] = c; ((u64u*)d)[3] = e;
+        d += 32; s += 32; n -= 32;
+    }
+    while (n >= 8) { *(u64u*)d = *(const u64u*)s; d += 8; s += 8; n -= 8; }
+    while (n--) *d++ = *s++;
+    return dst;
+}
+
+void* memmove(void* dst, const void* src, size_t n) {
+    uint8_t* d = (uint8_t*)dst;
+    const uint8_t* s = (const uint8_t*)src;
+    if (d == s || n == 0) return dst;
+    if (d < s || d >= s + n) return memcpy(dst, src, n);
+    d += n;
+    s += n;
+    while (n >= 8) { d -= 8; s -= 8; n -= 8; *(u64u*)d = *(const u64u*)s; }
+    while (n--) *--d = *--s;
+    return dst;
+}
+
+void* memset(void* dst, int c, size_t n) {
+    uint8_t* d = (uint8_t*)dst;
+    uint64_t fill = (uint8_t)c * 0x0101010101010101ull;
+    while (n >= 32) {
+        ((u64u*)d)[0] = fill; ((u64u*)d)[1] = fill; ((u64u*)d)[2] = fill; ((u64u*)d)[3] = fill;
+        d += 32; n -= 32;
+    }
+    while (n >= 8) { *(u64u*)d = fill; d += 8; n -= 8; }
+    while (n--) *d++ = (uint8_t)c;
+    return dst;
+}
+#else
 void* memcpy(void* dst, const void* src, size_t n) {
     void* ret = dst;
 #ifdef __i386__
@@ -38,6 +79,7 @@ void* memset(void* dst, int c, size_t n) {
     asm volatile("rep stosb" : "+D"(dst), "+c"(n) : "a"(c) : "memory");
     return ret;
 }
+#endif
 
 int memcmp(const void* a, const void* b, size_t n) {
     const uint8_t* x = (const uint8_t*)a;
@@ -313,7 +355,9 @@ int vsnprintf(char* buf, size_t size, const char* fmt, va_list ap) {
         }
         int lng = 0;
         while (*fmt == 'l') { lng++; fmt++; }
-        if (*fmt == 'z' || *fmt == 'j' || *fmt == 't') { lng = 2; fmt++; }
+        if (lng == 1 && sizeof(long) == 4) lng = 0;                 // on 32-bit, long and size_t are one word
+        if (*fmt == 'z' || *fmt == 't') { lng = sizeof(size_t) == 8 ? 2 : 0; fmt++; }
+        else if (*fmt == 'j') { lng = 2; fmt++; }
         if (*fmt == 'h') { fmt++; if (*fmt == 'h') fmt++; }
         switch (*fmt) {
         case 'd': case 'i': {

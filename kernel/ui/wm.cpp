@@ -16,6 +16,7 @@
 #include "drivers/framebuffer.h"
 #include "drivers/input.h"
 #include "arch/interrupts.h"
+#include "arch/cpu.h"
 #include "lib/log.h"
 #include "lib/math.h"
 
@@ -23,7 +24,8 @@ namespace wm {
 
 namespace {
 
-Canvas* g_screen;          // back buffer
+Canvas* g_screen;          // back buffer, half-finished while a frame is composed
+Canvas* g_front;           // finished picture currently on screen, without the cursor
 Canvas* g_wallpaper;
 int g_wallpaper_index = 0;
 int W, H;
@@ -43,11 +45,12 @@ Point g_mouse{0, 0};
 uint8_t g_buttons;
 uint64_t g_frames;
 uint64_t g_last_frame_ms, g_last_shell_ms;
+uint64_t g_next_draw_ms;
 float g_fps;
 uint64_t g_fps_t0, g_fps_n;
 
 // interaction state
-enum class Drag { None, Move, Resize, Content, Shell };
+enum class Drag { None, Move, Resize, Content, Shell, ViewBar };
 Drag g_drag = Drag::None;
 Window* g_drag_win;
 int g_drag_dx, g_drag_dy;
@@ -62,6 +65,7 @@ Window* g_hover_traffic_win;
 // cursor
 Canvas* g_cursor;
 Point g_cursor_drawn{-100, -100};
+volatile int g_pointer_x, g_pointer_y;   // updated by the mouse interrupt
 constexpr int kCursorW = 20, kCursorH = 26;
 
 void build_cursor() {
@@ -180,6 +184,24 @@ void draw_traffic_lights(Canvas& c, Window* w, Rect f) {
     }
 }
 
+// scrollbar of a fixed-layout window too tall for the screen
+constexpr int kViewBarW = 12;
+
+Rect view_bar_thumb(Window* w) {
+    Rect cr = w->content_rect();
+    int th = kmax(30, cr.h * cr.h / w->height());
+    int range = w->height() - cr.h;
+    int y = cr.y + (range > 0 ? (cr.h - th) * w->view_scroll() / range : 0);
+    return Rect(cr.right() - kViewBarW + 2, y, kViewBarW - 4, th);
+}
+
+void view_bar_drag(Window* w, int mouse_y) {
+    Rect cr = w->content_rect();
+    int th = view_bar_thumb(w).h;
+    int track = cr.h - th;
+    if (track > 0) w->set_view_scroll((mouse_y - cr.y - th / 2) * (w->height() - cr.h) / track);
+}
+
 void compose_window(Canvas& s, Window* w, Rect clip) {
     Rect f = w->frame();
     if (!shadow_bounds(w).intersects(clip)) return;
@@ -199,11 +221,20 @@ void compose_window(Canvas& s, Window* w, Rect clip) {
         GlassStyle gs = window_glass();
         gs.radius = kWindowRadius;
         // render glass for the full window shape but only inside the glass region
+        // a sidebar window's body is opaque, so frost only the title bar and sidebar
+        Rect pieces[2] = {gr, Rect()};
+        if (!(w->flags() & WF_GLASS) && w->sidebar_width() > 0) {
+            pieces[0] = Rect(f.x, f.y, f.w, kTitlebarHeight + 1);
+            pieces[1] = Rect(f.x, f.y + kTitlebarHeight + 1, w->sidebar_width(), f.h - kTitlebarHeight - 1);
+        }
         s.restore();
-        s.save();
-        s.clip_to(clip.intersect(gr));
-        glass_render(s, f, gs, s.clip());
-        s.restore();
+        for (const Rect& piece : pieces) {
+            if (piece.empty()) continue;
+            s.save();
+            s.clip_to(clip.intersect(piece));
+            glass_render(s, f, gs, s.clip());
+            s.restore();
+        }
         s.save();
         s.clip_to(clip);
     }
@@ -217,15 +248,15 @@ void compose_window(Canvas& s, Window* w, Rect clip) {
     if (!body.empty()) {
         s.save();
         s.clip_to(body);
-        if (glassy) s.draw(cc, cr.x, cr.y);
-        else s.blit(cc, cr.x, cr.y);
+        if (glassy) s.draw(cc, cr.x, cr.y - w->view_scroll());
+        else s.blit(cc, cr.x, cr.y - w->view_scroll());
         s.restore();
     }
     // bottom R rows: coverage-masked so the corners come out round
     Rect tail = Rect(cr.x, cr.bottom() - R, cr.w, R).intersect(clip);
     for (int y = tail.y; y < tail.bottom(); y++) {
         uint32_t* dst = s.row(y);
-        const uint32_t* src = cc.row(y - cr.y);
+        const uint32_t* src = cc.row(y - cr.y + w->view_scroll());
         float dy = y + 0.5f - (cr.bottom() - R);
         for (int x = tail.x; x < tail.right(); x++) {
             uint32_t p = src[x - cr.x];
@@ -241,6 +272,11 @@ void compose_window(Canvas& s, Window* w, Rect clip) {
             if (!glassy && cov == 255) dst[x] = p;
             else dst[x] = px_over(dst[x], cov == 255 ? p : px_scale(p, cov));
         }
+    }
+    if (w->overflows()) {
+        Rect thumb = view_bar_thumb(w);
+        s.fill_round_rect(Rect(cr.right() - kViewBarW, cr.y, kViewBarW, cr.h), 0, theme().dark ? rgba(255, 255, 255, 18) : rgba(0, 0, 0, 14));
+        s.fill_round_rect(thumb, 4, theme().dark ? rgba(255, 255, 255, 120) : rgba(0, 0, 0, 110));
     }
     // titlebar contents
     if (!(w->flags() & WF_NO_TITLE)) {
@@ -274,27 +310,40 @@ void present(Rect r) {
     FramebufferInfo& fb = framebuffer();
     for (int y = r.y; y < r.bottom(); y++) {
         uint32_t* dst = (uint32_t*)((uint8_t*)fb.address + (size_t)y * fb.pitch) + r.x;
-        const uint32_t* src = g_screen->row(y) + r.x;
-        memcpy(dst, src, r.w * 4);
+        uint32_t* front = g_front->row(y) + r.x;
+        memcpy(front, g_screen->row(y) + r.x, r.w * 4);
+        memcpy(dst, front, r.w * 4);
     }
 }
 
+// The cursor goes straight to the framebuffer from the mouse interrupt, so it keeps
+// moving whatever the main loop is busy with. It only reads g_front, never the
+// back buffer, because an interrupt can land in the middle of composing a frame.
 void draw_cursor_to_fb() {
-    // cursor is drawn directly into the framebuffer over the back buffer copy
+    IrqGuard guard;
     FramebufferInfo& fb = framebuffer();
-    // restore old position from back buffer
+    Point at{g_pointer_x, g_pointer_y};
     Rect old(g_cursor_drawn.x, g_cursor_drawn.y, kCursorW, kCursorH);
     old = old.intersect(Rect(0, 0, W, H));
-    if (!old.empty()) present(old);
-    Rect nr(g_mouse.x, g_mouse.y, kCursorW, kCursorH);
+    for (int y = old.y; y < old.bottom(); y++) {
+        uint32_t* dst = (uint32_t*)((uint8_t*)fb.address + (size_t)y * fb.pitch) + old.x;
+        memcpy(dst, g_front->row(y) + old.x, old.w * 4);
+    }
+    Rect nr(at.x, at.y, kCursorW, kCursorH);
     nr = nr.intersect(Rect(0, 0, W, H));
     for (int y = nr.y; y < nr.bottom(); y++) {
         uint32_t* dst = (uint32_t*)((uint8_t*)fb.address + (size_t)y * fb.pitch);
-        const uint32_t* bb = g_screen->row(y);
-        const uint32_t* cur = g_cursor->row(y - g_mouse.y);
-        for (int x = nr.x; x < nr.right(); x++) dst[x] = px_over(bb[x], cur[x - g_mouse.x]);
+        const uint32_t* bb = g_front->row(y);
+        const uint32_t* cur = g_cursor->row(y - at.y);
+        for (int x = nr.x; x < nr.right(); x++) dst[x] = px_over(bb[x], cur[x - at.x]);
     }
-    g_cursor_drawn = g_mouse;
+    g_cursor_drawn = at;
+}
+
+void pointer_moved(int x, int y) {
+    g_pointer_x = x;
+    g_pointer_y = y;
+    draw_cursor_to_fb();
 }
 
 // ----------------------------------------------------------------- input
@@ -346,7 +395,10 @@ void handle_mouse(const InputEvent& ev) {
         Window* w = window_at(ev.x, ev.y);
         if (w) {
             Rect cr = w->content_rect();
-            if (cr.contains(ev.x, ev.y)) w->on_scroll(ev.x - cr.x, ev.y - cr.y, ev.wheel);
+            if (cr.contains(ev.x, ev.y)) {
+                if (w->overflows()) w->set_view_scroll(w->view_scroll() + ev.wheel * 40);
+                else w->on_scroll(ev.x - cr.x, ev.y - cr.y, ev.wheel);
+            }
         }
     }
 
@@ -395,9 +447,15 @@ void handle_mouse(const InputEvent& ev) {
             }
             return;
         }
+        if (button == MB_LEFT && w->overflows() && cr.contains(ev.x, ev.y) && ev.x >= cr.right() - kViewBarW) {
+            g_drag = Drag::ViewBar;
+            g_drag_win = w;
+            view_bar_drag(w, ev.y);
+            return;
+        }
         if (cr.contains(ev.x, ev.y)) {
             uint64_t now = timer_ms();
-            int lx = ev.x - cr.x, ly = ev.y - cr.y;
+            int lx = ev.x - cr.x, ly = ev.y - cr.y + w->view_scroll();
             bool dbl = button == MB_LEFT && g_last_click_win == w && now - g_last_click_ms < 400 &&
                        abs(ev.x - g_last_click_pos.x) < 5 && abs(ev.y - g_last_click_pos.y) < 5;
             g_last_click_ms = dbl ? 0 : now;
@@ -419,7 +477,7 @@ void handle_mouse(const InputEvent& ev) {
         int button = released & MB_LEFT ? MB_LEFT : released & MB_RIGHT ? MB_RIGHT : MB_MIDDLE;
         if (g_drag == Drag::Content && g_drag_win) {
             Rect cr = g_drag_win->content_rect();
-            g_drag_win->on_mouse_up(ev.x - cr.x, ev.y - cr.y, button);
+            g_drag_win->on_mouse_up(ev.x - cr.x, ev.y - cr.y + g_drag_win->view_scroll(), button);
         }
         if (g_drag == Drag::Move && g_drag_win) {
             // keep titlebar reachable
@@ -455,9 +513,13 @@ void handle_mouse(const InputEvent& ev) {
         (void)nx;
         return;
     }
+    if (g_drag == Drag::ViewBar && g_drag_win) {
+        view_bar_drag(g_drag_win, ev.y);
+        return;
+    }
     if (g_drag == Drag::Content && g_drag_win) {
         Rect cr = g_drag_win->content_rect();
-        g_drag_win->on_mouse_move(ev.x - cr.x, ev.y - cr.y, g_buttons);
+        g_drag_win->on_mouse_move(ev.x - cr.x, ev.y - cr.y + g_drag_win->view_scroll(), g_buttons);
         return;
     }
     // hover
@@ -468,7 +530,7 @@ void handle_mouse(const InputEvent& ev) {
         Rect tl(f.x + 8, f.y + 6, 66, kTitlebarHeight - 12);
         if (tl.contains(ev.x, ev.y) && !(w->flags() & WF_FULLSCREEN)) th = w;
         Rect cr = w->content_rect();
-        if (cr.contains(ev.x, ev.y)) w->on_mouse_move(ev.x - cr.x, ev.y - cr.y, 0);
+        if (cr.contains(ev.x, ev.y)) w->on_mouse_move(ev.x - cr.x, ev.y - cr.y + w->view_scroll(), 0);
     }
     if (th != g_hover_traffic_win) {
         if (g_hover_traffic_win) damage(Rect(g_hover_traffic_win->frame().x, g_hover_traffic_win->frame().y, 80, kTitlebarHeight));
@@ -509,10 +571,13 @@ void init() {
     W = fb.width;
     H = fb.height;
     g_screen = new Canvas(W, H);
+    g_front = new Canvas(W, H);
     g_wallpaper = new Canvas(W, H);
     wallpaper_render(*g_wallpaper, g_wallpaper_index);
     build_cursor();
     g_mouse = Point{W / 2, H / 2};
+    g_pointer_x = g_mouse.x;
+    g_pointer_y = g_mouse.y;
     // blend speed decides how much glass this machine can afford
     uint64_t t0 = timer_ms();
     uint32_t v = 0x80404040;
@@ -525,6 +590,7 @@ void init() {
     klog("wm: blend test %llu ms, %s graphics", (unsigned long long)took, g_lite ? "lite" : "full");
     shell_init();
     damage_all();
+    input_set_pointer_hook(pointer_moved);
     klog("wm: %dx%d compositor ready", W, H);
 }
 
@@ -637,13 +703,21 @@ void request_logout() { if (g_logout) defer(g_logout); }
 
 void frame() {
     uint64_t now = timer_ms();
-    // input
-    InputEvent ev;
+    // input; plain pointer motion is coalesced so a slow frame can't queue up hover work
+    InputEvent ev, motion;
+    bool have_motion = false;
     int n = 0;
     while (input_poll(&ev) && n++ < 256) {
+        if (ev.type == InputEvent::MOUSE && !ev.wheel && !ev.buttons && !g_buttons) {
+            motion = ev;
+            have_motion = true;
+            continue;
+        }
+        if (have_motion) { handle_mouse(motion); have_motion = false; }
         if (ev.type == InputEvent::MOUSE) handle_mouse(ev);
         else handle_key(ev.key);
     }
+    if (have_motion) handle_mouse(motion);
     // deferred work (window deletion etc.)
     if (!g_deferred.empty()) {
         Vector<Func<void()>> work = std::move(g_deferred);
@@ -667,24 +741,37 @@ void frame() {
         g_last_shell_ms = now;
     }
     // paint dirty windows
-    for (Window* w : g_windows)
+    uint64_t work_t0 = timer_ms();
+    // when drawing is slow, leave as much time free as the last frame took so the
+    // cursor and input keep moving between repaints
+    bool draw_now = work_t0 >= g_next_draw_ms;
+    if (draw_now) for (Window* w : g_windows)
         if (w->needs_paint() && !w->closing_) {
-            w->paint_now();
-            if (window_has_glass(w)) damage(window_glass_rect(w));
+            w->paint_now();     // damages its content; glass is grown in normalize_damage if it shows through
         }
+    uint64_t paint_ms = timer_ms() - work_t0;
     // compose
-    if (!g_damage.empty()) {
+    if (draw_now && !g_damage.empty()) {
         normalize_damage();
         Vector<Rect> dmg = std::move(g_damage);
         g_damage = Vector<Rect>();
         for (Rect& r : dmg) compose_region(r);
         for (Rect& r : dmg) present(r);
+        uint64_t work_ms = timer_ms() - work_t0;
+        g_next_draw_ms = work_ms >= 8 ? timer_ms() + kmin(work_ms, (uint64_t)100) : 0;
+        if (work_ms >= 30) {
+            static uint64_t last_slow_log;
+            if (!last_slow_log || timer_ms() - last_slow_log >= 1000) {
+                last_slow_log = timer_ms();
+                klog("wm: slow frame %u ms (paint %u, compose %u)", (unsigned)work_ms, (unsigned)paint_ms, (unsigned)(work_ms - paint_ms));
+            }
+        }
         // keep g_cursor_drawn: draw_cursor_to_fb() restores the old spot from the back buffer
         draw_cursor_to_fb();
-    } else if (g_cursor_drawn.x != g_mouse.x || g_cursor_drawn.y != g_mouse.y) {
+    } else if (g_cursor_drawn.x != g_pointer_x || g_cursor_drawn.y != g_pointer_y) {
         draw_cursor_to_fb();
     }
-    asm volatile("sfence");
+    cpu_store_fence();
     g_frames++;
     g_fps_n++;
     if (now - g_fps_t0 >= 1000) {

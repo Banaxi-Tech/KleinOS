@@ -16,6 +16,7 @@ struct Node {
     size_t size = 0;
     size_t capacity = 0;       // 0 = data points to external (initrd) memory
     uint64_t mtime = 0;        // unix time
+    bool unsaved = true;       // contents differ from the copy on disk
     Node* parent = nullptr;
     Vector<Node*> children;
 };

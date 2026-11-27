@@ -213,13 +213,16 @@ void flush_pending(uint32_t ip, const uint8_t* mac) {
         }
 }
 
+// What reaches us unasked, logged while a port is listening (rx_diag_log).
+uint32_t g_heard_arp, g_heard_ping, g_heard_syn;
+
 void arp_receive(const uint8_t* p, size_t len) {
     if (len < 28) return;
     uint16_t op = rd16(p + 6);
     uint32_t spa = rd32(p + 14), tpa = rd32(p + 24);
     if (spa) arp_store(spa, p + 8);
     flush_pending(spa, p + 8);
-    if (op == 1 && g_configured && tpa == g_ip) arp_send(2, p + 8, spa);
+    if (op == 1 && g_configured && tpa == g_ip) { g_heard_arp++; arp_send(2, p + 8, spa); }
 }
 
 // ================================================================ IPv4
@@ -332,6 +335,7 @@ void dhcp_receive(const uint8_t* p, size_t len) {
         o += 2 + l;
     }
     if (type == 2 && g_dhcp == DhcpState::Discovering) {
+        klog("net: DHCP offer received");
         g_dhcp_offer = yiaddr;
         g_dhcp_server = server;
         g_dhcp = DhcpState::Requesting;
@@ -444,6 +448,7 @@ uint16_t g_ping_seq = 1;
 void icmp_receive(uint32_t src, const uint8_t* p, size_t len) {
     if (len < 8) return;
     if (p[0] == 8) {   // echo request -> reply
+        g_heard_ping++;
         uint8_t r[1480];
         if (len > sizeof(r)) return;
         memcpy(r, p, len);
@@ -459,7 +464,7 @@ void icmp_receive(uint32_t src, const uint8_t* p, size_t len) {
 }
 
 // ================================================================ TCP
-enum class TS { Closed, SynSent, Established, FinWait1, FinWait2, CloseWait, LastAck, Error };
+enum class TS { Closed, SynSent, SynRcvd, Established, FinWait1, FinWait2, CloseWait, LastAck, Error };
 
 struct Tcp {
     bool used;
@@ -477,6 +482,8 @@ struct Tcp {
     size_t rhead, rlen, rcap;
     bool fin_received, fin_sent, close_requested;
     uint64_t last_tx, rto;
+    bool accepted;              // handed to tcp_accept
+    bool ack_pending;           // in-order data arrived; one ACK covers the whole receive batch
     int retries;
     uint64_t last_ack_sent;
 };
@@ -484,7 +491,10 @@ constexpr int kMaxTcp = 32;
 Tcp g_tcp[kMaxTcp];
 uint16_t g_next_port = 49152;
 
+constexpr size_t kDriverNicWindow = 22 * 1460;
+
 void tcp_segment(Tcp& t, uint8_t flags, uint32_t seq, const uint8_t* data, size_t len) {
+    if (flags & 0x10) t.ack_pending = false;
     uint8_t seg[1480];
     int hl = 20 + ((flags & 0x02) ? 4 : 0);
     wr16(seg, t.lport);
@@ -494,7 +504,9 @@ void tcp_segment(Tcp& t, uint8_t flags, uint32_t seq, const uint8_t* data, size_
     seg[12] = (hl / 4) << 4;
     seg[13] = flags;
     size_t free = t.rcap - t.rlen;
-    wr16(seg + 14, free > 65535 ? 65535 : (uint16_t)free);
+    // a Wi-Fi driver's receive ring is drained only once per main-loop pass, so keep bursts smaller than it
+    size_t window = g_ext_nic ? kDriverNicWindow : 65535;
+    wr16(seg + 14, free > window ? (uint16_t)window : (uint16_t)free);
     wr16(seg + 16, 0);
     wr16(seg + 18, 0);
     if (flags & 0x02) { seg[20] = 2; seg[21] = 4; wr16(seg + 22, 1460); }
@@ -545,6 +557,43 @@ void tcp_free(Tcp& t) {
     t = Tcp{};
 }
 
+uint16_t g_listen_port;
+constexpr int kMaxPendingAccepts = 2;
+
+// A connection to the listening port. Only addresses on our own subnet get an answer.
+bool accept_syn(uint32_t src, uint16_t sport, uint16_t dport, uint32_t seq, uint16_t wnd) {
+    Status st = status();
+    if (!st.configured || !st.netmask || (src & st.netmask) != (st.ip & st.netmask)) return false;
+    int pending = 0;
+    for (Tcp& t : g_tcp) if (t.used && t.lport == dport && !t.accepted) pending++;
+    if (pending >= kMaxPendingAccepts) return false;
+    for (Tcp& t : g_tcp) {
+        if (t.used) continue;
+        t = Tcp{};
+        t.used = true;
+        t.state = TS::SynRcvd;
+        t.rip = src;
+        t.rport = sport;
+        t.lport = dport;
+        t.iss = (uint32_t)cpu_random64();
+        t.snd_una = t.iss;
+        t.snd_nxt = t.iss + 1;
+        t.irs = seq;
+        t.rcv_nxt = seq + 1;
+        t.snd_wnd = wnd;
+        t.mss = 1460;
+        t.scap = 128 * 1024;
+        t.sbuf = (uint8_t*)kmalloc(t.scap);
+        t.rcap = 128 * 1024;
+        t.rbuf = (uint8_t*)kmalloc(t.rcap);
+        t.rto = 600;
+        t.last_tx = timer_ms();
+        tcp_segment(t, 0x12, t.iss, nullptr, 0);
+        return true;
+    }
+    return false;
+}
+
 void tcp_receive(uint32_t src, const uint8_t* p, size_t len) {
     if (len < 20) return;
     uint16_t sport = rd16(p), dport = rd16(p + 2);
@@ -560,6 +609,15 @@ void tcp_receive(uint32_t src, const uint8_t* p, size_t len) {
     for (Tcp& t : g_tcp)
         if (t.used && t.lport == dport && t.rport == sport && t.rip == src) { tp = &t; break; }
     if (!tp) {
+        if ((flags & 0x13) == 0x02 && g_listen_port && dport == g_listen_port) {
+            bool accepted = accept_syn(src, sport, dport, seq, wnd);
+            if (g_heard_syn++ < 8) {
+                char ip[16];
+                ip_to_string(src, ip);
+                klog("net: connection request from %s to port %u, %s", ip, dport, accepted ? "answered" : "refused");
+            }
+            if (accepted) return;
+        }
         if (!(flags & 0x04)) tcp_send_rst(src, dport, sport, (flags & 0x10) ? ack : 0, seq + dlen + ((flags & 0x03) ? 1 : 0));
         return;
     }
@@ -568,6 +626,14 @@ void tcp_receive(uint32_t src, const uint8_t* p, size_t len) {
         t.state = t.state == TS::SynSent ? TS::Error : TS::Closed;
         if (t.state == TS::Closed) t.fin_received = true;
         return;
+    }
+    if (t.state == TS::SynRcvd) {
+        if (flags & 0x02) { tcp_segment(t, 0x12, t.iss, nullptr, 0); return; }   // our answer was lost
+        if (!(flags & 0x10) || ack != t.iss + 1) return;
+        t.snd_una = ack;
+        t.snd_wnd = wnd;
+        t.state = TS::Established;
+        t.retries = 0;
     }
     if (t.state == TS::SynSent) {
         if ((flags & 0x12) == 0x12 && ack == t.iss + 1) {
@@ -622,8 +688,10 @@ void tcp_receive(uint32_t src, const uint8_t* p, size_t len) {
             for (size_t i = 0; i < n; i++) t.rbuf[(t.rhead + t.rlen + i) % t.rcap] = data[i];
             t.rlen += n;
             t.rcv_nxt += n;
+            t.ack_pending = true;
+        } else {
+            need_ack = true;   // duplicate/out-of-order -> immediate (dup) ACK
         }
-        need_ack = true;   // in-order or duplicate/out-of-order -> (dup) ACK
     }
     if ((flags & 0x01) && seq + dlen == t.rcv_nxt && !t.fin_received) {
         t.rcv_nxt++;
@@ -640,13 +708,15 @@ void tcp_timers() {
     uint64_t now = timer_ms();
     for (Tcp& t : g_tcp) {
         if (!t.used) continue;
-        bool outstanding = t.state == TS::SynSent || t.snd_nxt != t.snd_una;
+        bool outstanding = t.state == TS::SynSent || t.state == TS::SynRcvd || t.snd_nxt != t.snd_una;
         if (outstanding && now - t.last_tx > t.rto) {
             if (++t.retries > 8) { t.state = TS::Error; continue; }
             t.rto = t.rto * 2 > 8000 ? 8000 : t.rto * 2;
             t.last_tx = now;
             if (t.state == TS::SynSent) {
                 tcp_segment(t, 0x02, t.iss, nullptr, 0);
+            } else if (t.state == TS::SynRcvd) {
+                tcp_segment(t, 0x12, t.iss, nullptr, 0);
             } else {
                 // go-back-N: resend from snd_una
                 bool fin_pending = t.fin_sent && t.snd_nxt - t.snd_una == t.slen + 1;
@@ -732,9 +802,16 @@ void init() {
     dhcp_send(1);
 }
 
+static bool g_in_poll;
+bool in_poll() { return g_in_poll; }
+
 void poll() {
-    if (!g_nic) return;
+    if (!g_nic || g_in_poll) return;
+    g_in_poll = true;
+    struct Leave { ~Leave() { g_in_poll = false; } } leave;
     rx_poll();
+    for (Tcp& t : g_tcp)
+        if (t.used && t.ack_pending) tcp_segment(t, 0x10, t.snd_nxt, nullptr, 0);
     uint64_t now = timer_ms();
     if ((g_dhcp == DhcpState::Discovering || g_dhcp == DhcpState::Requesting) && now - g_dhcp_time > 2000) {
         g_dhcp = DhcpState::Discovering;
@@ -750,6 +827,11 @@ void poll() {
     for (Ping& pg : g_pings)
         if (pg.used && pg.rtt < 0 && now - pg.sent > 4000) pg.used = false;
     tcp_timers();
+    static uint64_t next_diag;
+    if (g_listen_port && now >= next_diag) {
+        next_diag = now + 20000;
+        klog("net: heard from others: arp %u, ping %u, connection requests %u", g_heard_arp, g_heard_ping, g_heard_syn);
+    }
 }
 
 bool is_up() { return g_configured && link_up(); }
@@ -845,6 +927,22 @@ int ping_result(int seq) {
     return -2;   // unknown / timed out
 }
 
+void tcp_listen(uint16_t port) { g_listen_port = port; }
+
+int tcp_accept() {
+    if (!g_listen_port) return -1;
+    uint64_t now = timer_ms();
+    for (int i = 0; i < kMaxTcp; i++) {
+        Tcp& t = g_tcp[i];
+        if (!t.used || t.lport != g_listen_port || t.accepted) continue;
+        if (t.state == TS::Established) { t.accepted = true; return i; }
+        if (now - t.last_tx > 10000) tcp_free(t);   // the handshake was never finished
+    }
+    return -1;
+}
+
+uint32_t tcp_peer_ip(int s) { return s >= 0 && s < kMaxTcp && g_tcp[s].used ? g_tcp[s].rip : 0; }
+
 int tcp_connect(uint32_t ip, uint16_t port) {
     if (!g_configured) return -1;
     for (int i = 0; i < kMaxTcp; i++) {
@@ -861,6 +959,7 @@ int tcp_connect(uint32_t ip, uint16_t port) {
         t.snd_una = t.iss;
         t.snd_nxt = t.iss + 1;
         t.mss = 1460;
+        t.ack_pending = false;
         t.scap = 16384;
         t.sbuf = (uint8_t*)kmalloc(t.scap);
         t.rcap = 256 * 1024;
@@ -876,7 +975,7 @@ int tcp_connect(uint32_t ip, uint16_t port) {
 TcpState tcp_state(int s) {
     if (s < 0 || s >= kMaxTcp || !g_tcp[s].used) return TcpState::Error;
     switch (g_tcp[s].state) {
-    case TS::SynSent: return TcpState::Connecting;
+    case TS::SynSent: case TS::SynRcvd: return TcpState::Connecting;
     case TS::Established: case TS::FinWait1: case TS::FinWait2: case TS::CloseWait: case TS::LastAck: return TcpState::Open;
     case TS::Error: return TcpState::Error;
     default: return TcpState::Closed;

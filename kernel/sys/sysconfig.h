@@ -2,9 +2,8 @@
 // Persistent system configuration + user data on the install disk.
 //
 // Disk layout (written by Setup, see Makefile "system.img"):
-//   MBR + GRUB core, partition 1 FAT16 (kernel, initrd), partition 2 type 0x7f:
-//     sector 0      : SysConfig header (this struct)
-//     sector 8..    : serialized /Users tree (vfs::serialize), up to the end
+//   MBR + GRUB core, then one FAT32 partition holding /boot (kernel, initrd),
+//   /KleinOS/config.bin (this struct) and /Users as ordinary files.
 #include <stdint.h>
 #include <stddef.h>
 
@@ -34,8 +33,6 @@ struct SysConfig {
     uint32_t wallpaper;
     uint32_t user_count;
     UserAccount users[4];
-    uint32_t data_bytes;      // size of serialized /Users blob
-    uint32_t data_checksum;
 };
 
 // Probe drives for an installed KleinOS data partition. Returns false if none.
@@ -47,14 +44,16 @@ int sysconfig_drive();             // ATA drive index of the install, -1 if none
 // Hash a password for UserAccount::password_hash.
 void sysconfig_hash_password(const char* login, const char* password, char out[65]);
 bool sysconfig_check_password(const UserAccount& u, const char* password);
+enum class PasswordChangeResult { Saved, Unavailable, IncorrectPassword, SaveFailed };
+// Change an existing account after checking its current password. Empty new password removes it.
+// Restores the in-memory hash if writing the configuration fails.
+PasswordChangeResult sysconfig_change_password(const char* login, const char* current_password,
+                                              const char* new_password);
 
 // User file persistence: load /Users from disk; save it (debounced) on change.
 void userdata_load();
 void userdata_enable_autosave();
 bool userdata_save_now();
 
-// Used by Setup: write a fresh config into the data partition of `drive`
-// (whose MBR was just written from system.img).
+// Used by Setup: write a fresh config onto `drive`, whose system.img was just written.
 bool sysconfig_init_on_drive(int drive, const SysConfig& cfg);
-// Partition 2 (data) start LBA / size of a drive, from its MBR. False if absent.
-bool sysconfig_find_data_partition(int drive, uint64_t* lba, uint64_t* sectors);

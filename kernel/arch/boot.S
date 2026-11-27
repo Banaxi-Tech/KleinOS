@@ -10,13 +10,18 @@ mb2_header:
     .long 0
     .long mb2_header_end - mb2_header
     .long 0x100000000 - (MB2_MAGIC + (mb2_header_end - mb2_header))
-    # framebuffer tag: request 1280x800x32
+    # framebuffer tag: 32-bit builds are for old netbooks, so ask for their panel size
     .align 8
     .short 5
     .short 0
     .long 20
+#ifdef __i386__
+    .long 1024
+    .long 600
+#else
     .long 1280
     .long 800
+#endif
     .long 32
     # module alignment tag
     .align 8

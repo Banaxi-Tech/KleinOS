@@ -83,8 +83,12 @@ void sleep_ms(uint64_t ms) {
     while (g_ticks < end) asm volatile("sti; hlt");
 }
 
+static bool (*g_debug_trap)(InterruptFrame*);
+void set_debug_trap(bool (*handler)(InterruptFrame*)) { g_debug_trap = handler; }
+
 extern "C" void isr_dispatch(InterruptFrame* f) {
     if (f->vector < 32) {
+        if ((f->vector == 1 || f->vector == 3) && g_debug_trap && g_debug_trap(f)) return;
         const char* name = f->vector < sizeof(kExceptionNames) / sizeof(kExceptionNames[0])
                                ? kExceptionNames[f->vector] : "Exception";
         uintptr_t cr2;

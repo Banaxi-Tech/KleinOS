@@ -78,6 +78,11 @@ public:
     void center();
     Rect frame() const;                                  // screen rect incl. titlebar
     Rect content_rect() const;                           // screen rect of content
+    // A fixed-layout window taller than the screen shows part of its content and scrolls.
+    bool overflows() const { return view_h_ > 0; }
+    int view_height() const { return view_h_ > 0 ? view_h_ : ch_; }
+    int view_scroll() const { return view_scroll_; }
+    void set_view_scroll(int y);
     void set_ticking(bool on) { ticking_ = on; }
     bool ticking() const { return ticking_; }
     void set_min_size(int w, int h) { min_w_ = w; min_h_ = h; }
@@ -118,6 +123,7 @@ private:
     String app_id_;
     uint32_t flags_;
     int cw_, ch_;
+    int view_h_ = 0, view_scroll_ = 0;
     int min_w_ = 200, min_h_ = 120;
     int sidebar_w_ = 0;
     bool dirty_ = true;

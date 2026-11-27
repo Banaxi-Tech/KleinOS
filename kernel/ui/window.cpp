@@ -8,6 +8,15 @@ Window::Window(const char* title, int cw, int ch, uint32_t flags) : title_(title
     if (flags & WF_FULLSCREEN) {
         cw_ = wm::screen_width();
         ch_ = wm::screen_height();
+    } else if (flags & WF_RESIZABLE) {
+        // open within the usable screen; these windows lay themselves out from their size
+        Rect d = wm::desktop_area();
+        if (cw_ > d.w - 12) cw_ = d.w - 12;
+        if (ch_ > d.h - 12 - kTitlebarHeight) ch_ = d.h - 12 - kTitlebarHeight;
+    } else {
+        // fixed layouts keep their size and scroll inside the usable screen instead
+        Rect d = wm::desktop_area();
+        if (ch_ > d.h - 12 - kTitlebarHeight) view_h_ = d.h - 12 - kTitlebarHeight;
     }
     content_.resize(cw_, ch_);
     center();
@@ -22,12 +31,21 @@ Window::~Window() {
 
 Rect Window::frame() const {
     if (flags_ & WF_FULLSCREEN) return Rect(x_, y_, cw_, ch_);
-    return Rect(x_, y_, cw_, ch_ + kTitlebarHeight);
+    return Rect(x_, y_, cw_, view_height() + kTitlebarHeight);
 }
 
 Rect Window::content_rect() const {
     if (flags_ & WF_FULLSCREEN) return Rect(x_, y_, cw_, ch_);
-    return Rect(x_, y_ + kTitlebarHeight, cw_, ch_);
+    return Rect(x_, y_ + kTitlebarHeight, cw_, view_height());
+}
+
+void Window::set_view_scroll(int y) {
+    if (!overflows()) return;
+    if (y > ch_ - view_h_) y = ch_ - view_h_;
+    if (y < 0) y = 0;
+    if (y == view_scroll_) return;
+    view_scroll_ = y;
+    wm::damage(content_rect());
 }
 
 void Window::invalidate() {

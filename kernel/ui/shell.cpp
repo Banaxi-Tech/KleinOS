@@ -1,5 +1,6 @@
 // Desktop shell: menubar, Dock, Launchpad, Spotlight, Control Center,
 // notifications, popup menus.
+#include "drivers/battery.h"
 #include "ui/shell.h"
 #include "ui/wm.h"
 #include "ui/app.h"
@@ -13,6 +14,7 @@
 #include "fs/vfs.h"
 #include "sys/system.h"
 #include "net/net.h"
+#include "ui/wifi_panel.h"
 #include "lib/math.h"
 #include "lib/log.h"
 
@@ -480,6 +482,19 @@ void draw_menubar(Canvas& s, Rect clip) {
     }
     draw_symbol(s, Rect(g_search_rect.x + 7, 7, 16, 16), Symbol::Search, tc, 1.7f);
     draw_symbol(s, Rect(g_net_rect.x + 6, 6, 18, 18), net::is_up() ? Symbol::Wifi : Symbol::WifiOff, tc, 1.6f);
+    const BatteryStatus& bat = battery_status();
+    if (bat.present) {
+        char pct[8];
+        snprintf(pct, sizeof(pct), "%d%%", bat.percent);
+        int tw = text_width(pct, 13, Font::Medium);
+        int bx = g_net_rect.x - 28, by = (kMenubarHeight - 11) / 2;
+        s.draw_text_in(Rect(bx - tw - 5, 0, tw + 2, kMenubarHeight), pct, tc, 13, Font::Medium);
+        s.stroke_round_rect(Rect(bx, by, 22, 11), 3, tc, 1.2f);
+        s.fill_rect(Rect(bx + 23, by + 3, 2, 5), tc);
+        int fill = (18 * bat.percent + 50) / 100;
+        Color level = bat.charging ? hex(0x34C759) : bat.percent <= 20 ? hex(0xFF3B30) : tc;
+        if (fill > 0) s.fill_round_rect(Rect(bx + 2, by + 2, fill, 7), 1.5f, level);
+    }
     s.restore();
 }
 
@@ -879,7 +894,7 @@ bool cc_click(int mx, int my) {
         switch (t.id) {
         case 0:
             if (my > t.r.y + 56) { g_bluetooth = !g_bluetooth; }
-            else app_launch("settings");
+            else { int right = g_net_rect.right() + 40; cc_close(); wifi_panel_toggle(right); return true; }
             break;
         case 1: theme_set_dark(!theme().dark); break;
         case 2: g_dnd = !g_dnd; break;
@@ -972,6 +987,8 @@ void shell_tick(uint64_t now) {
         dock_update_scales(now);
         static int net_state = -1;
         if (net::is_up() != net_state) { net_state = net::is_up(); damage(Rect(0, 0, W, kMenubarHeight)); }
+        static uint32_t battery_seen;
+        if (battery_generation() != battery_seen) { battery_seen = battery_generation(); damage(Rect(0, 0, W, kMenubarHeight)); }
     }
     if (g_spot_open && (now / 530) != ((now - 16) / 530)) damage(Rect(g_spot_rect.x, g_spot_rect.y, g_spot_rect.w, 56));
     // notifications: animate + expire
@@ -989,7 +1006,7 @@ void shell_glass_rects(Vector<Rect>& out) {
     if (shell_visible()) {
         out.push(Rect(0, 0, W, kMenubarHeight).expand(glass_margin(glass_style_bar(false))));
         out.push(g_dock_rect.expand(glass_margin(panel_glass())));
-        out.push(Rect(g_dock_rect.x - 200, g_dock_rect.y - 80, g_dock_rect.w + 400, 80));   // tooltips
+        if (g_dock_hover_index >= 0) out.push(Rect(g_dock_rect.x - 200, g_dock_rect.y - 80, g_dock_rect.w + 400, 80));   // tooltip
     }
     int m = glass_margin(panel_glass());
     if (g_popup.open) out.push(g_popup.rect.expand(m));
@@ -1099,25 +1116,18 @@ bool shell_mouse(const InputEvent& ev, uint8_t pressed, uint8_t released) {
             if (g_cc_rect.contains(mx, my)) { g_cc_open = true; cc_layout(); damage(g_cc_panel.expand(40)); damage(Rect(0, 0, W, kMenubarHeight + 20)); return true; }
             if (g_search_rect.contains(mx, my)) { open_spotlight(); return true; }
             if (g_clock_rect.contains(mx, my)) { app_launch("calendar"); return true; }
-            if (g_net_rect.contains(mx, my)) {
-                Vector<MenuItem> items;
-                MenuItem& a = items.emplace();
-                a.title = net::is_up() ? String("Ethernet: ") + net::ip_string() : String("Network: not connected");
-                a.enabled = false;
-                MenuItem& sp = items.emplace(); sp.title = "-";
-                MenuItem& b = items.emplace(); b.title = "Network Settings…"; b.action = [] { app_launch("settings"); };
-                popup_menu(g_net_rect.x, kMenubarHeight + 2, items);
-                return true;
-            }
+            if (g_net_rect.contains(mx, my)) { wifi_panel_toggle(g_net_rect.right() + 40); return true; }
         }
         return true;
     }
     // ---- dock
     bool in_dock = my >= g_dock_rect.y - 4 && mx >= g_dock_rect.x - 40 && mx < g_dock_rect.right() + 40;
     int hit = in_dock ? dock_hit(mx, my) : -1;
-    if (in_dock != g_dock_hover || mx != g_dock_mouse_x || hit != g_dock_hover_index) {
+    // the x position only changes the picture while the dock is magnifying under the cursor
+    bool magnify_moved = in_dock && dock_magnification() && mx != g_dock_mouse_x;
+    g_dock_mouse_x = mx;
+    if (in_dock != g_dock_hover || magnify_moved || hit != g_dock_hover_index) {
         g_dock_hover = in_dock;
-        g_dock_mouse_x = mx;
         g_dock_hover_index = hit;
         damage(g_dock_damage);
     }
@@ -1368,7 +1378,7 @@ void app_open_file(const char* path) {
     const char* app = "textedit";
     if (ext == "png" || ext == "jpg" || ext == "jpeg" || ext == "bmp" || ext == "gif") app = "photos";
     else if (ext == "html" || ext == "htm") app = "browser";
-    else if (ext == "dl") app = "activity";
+    else if (ext == "dl" || ext == "run") app = "activity";
     if (vfs::is_dir(path)) app = "files";
     if (!app_find(app)) { notify("Can't open file", path); return; }
     app_launch(app);

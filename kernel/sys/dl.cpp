@@ -3,6 +3,7 @@
 #include "lib/log.h"
 #include "lib/heap.h"
 #include "ui/app.h"
+#include "arch/cpu.h"
 
 namespace {
 
@@ -36,7 +37,11 @@ struct Elf_Reloc {   // Elf32_Rel: the addend lives at the target
 };
 enum { DT_RELOCS = 17, DT_RELOCS_SZ = 18 };
 #else
-constexpr int kElfClass = 2, kElfMachine = 62;
+#if defined(__aarch64__)
+constexpr int kElfClass = 2, kElfMachine = 183;      // EM_AARCH64
+#else
+constexpr int kElfClass = 2, kElfMachine = 62;       // EM_X86_64
+#endif
 struct Elf_Ehdr {
     uint8_t ident[16];
     uint16_t type, machine;
@@ -73,9 +78,23 @@ enum {
     PT_LOAD = 1, PT_DYNAMIC = 2,
     DT_NULL = 0, DT_NEEDED = 1, DT_PLTRELSZ = 2, DT_HASH = 4, DT_STRTAB = 5, DT_SYMTAB = 6,
     DT_INIT = 12, DT_JMPREL = 23, DT_INIT_ARRAY = 25, DT_INIT_ARRAYSZ = 27,
-    R_NONE = 0, R_WORD = 1, R_GLOB_DAT = 6, R_JUMP_SLOT = 7, R_RELATIVE = 8,   // same numbers on i386 and x86-64
+    R_NONE = 0,
+#if defined(__aarch64__)
+    R_WORD = 257, R_GLOB_DAT = 1025, R_JUMP_SLOT = 1026, R_RELATIVE = 1027,    // R_AARCH64_ABS64 / GLOB_DAT / JUMP_SLOT / RELATIVE
+#else
+    R_WORD = 1, R_GLOB_DAT = 6, R_JUMP_SLOT = 7, R_RELATIVE = 8,               // same numbers on i386 and x86-64
+#endif
     STB_WEAK = 2, SHN_UNDEF = 0,
 };
+
+// The ARM kernel is a position independent executable linked at 0, so kernel.sym holds link addresses and the
+// real ones are those plus the address it was loaded at. (x86 kernels are linked where they run.)
+#if defined(__aarch64__)
+extern "C" char __kernel_start[];
+inline uint64_t kernel_slide() { return (uint64_t)(uintptr_t)__kernel_start; }
+#else
+inline uint64_t kernel_slide() { return 0; }
+#endif
 
 // Kernel symbol hash table (open addressing).
 struct KSym { const char* name; uint64_t addr; };
@@ -148,7 +167,7 @@ bool dl_init() {
         if (sp) {
             *sp = 0;
             uint64_t addr = strtoul(p, nullptr, 16);
-            ksym_insert(sp + 1, addr);
+            ksym_insert(sp + 1, addr + kernel_slide());
         }
         if (!line_end) break;
         p = line_end + 1;
@@ -285,6 +304,7 @@ DlModule* dl_open(const char* path, bool is_library, String* error) {
         return nullptr;
     }
 
+    cpu_flush_icache(base, span);      // we just wrote code through the data cache (no-op on x86)
     g_modules.push(m);
     klog("dl: loaded %s at %p (%zu KiB, %d relocs, %d imports)", m->name.c_str(), base, (size_t)(span / 1024),
          m->relocations, m->imports);
@@ -305,7 +325,7 @@ int dl_load_dir(const char* dir, bool libraries) {
     // sort names
     Vector<String> names;
     for (vfs::Node* c : d->children)
-        if (!c->is_dir && vfs::extension(c->name.c_str()) == "dl") names.push(c->name);
+        if (!c->is_dir && vfs::extension(c->name.c_str()) == (libraries ? "dl" : "run")) names.push(c->name);
     for (size_t i = 1; i < names.size(); i++)
         for (size_t j = i; j > 0 && names[j] < names[j - 1]; j--) {
             String t = names[j]; names[j] = names[j - 1]; names[j - 1] = t;

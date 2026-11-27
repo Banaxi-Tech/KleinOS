@@ -2,8 +2,8 @@
 // System-level state: version, boot mode, main loop.
 #include <stdint.h>
 
-#define KLEIN_VERSION "1.0"   // main.sub; the full version appends the build: 1.0.144
-#define KLEIN_CODENAME "Aurora"
+#define KLEIN_VERSION "1.2"   // main.sub; the full version appends the build: 1.0.144
+#define KLEIN_CODENAME "Aurora pre_release"
 
 enum class BootMode { Live, Installer, Installed };
 

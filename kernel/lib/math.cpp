@@ -3,8 +3,13 @@
 
 extern "C" {
 
+#if defined(__aarch64__)
+double sqrt(double x) { double r; asm("fsqrt %d0, %d1" : "=w"(r) : "w"(x)); return r; }
+float sqrtf(float x) { float r; asm("fsqrt %s0, %s1" : "=w"(r) : "w"(x)); return r; }
+#else
 double sqrt(double x) { double r; asm("sqrtsd %1, %0" : "=x"(r) : "x"(x)); return r; }
 float sqrtf(float x) { float r; asm("sqrtss %1, %0" : "=x"(r) : "x"(x)); return r; }
+#endif
 double fabs(double x) { return x < 0 ? -x : x; }
 float fabsf(float x) { return x < 0 ? -x : x; }
 

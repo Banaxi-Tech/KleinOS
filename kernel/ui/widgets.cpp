@@ -826,5 +826,5 @@ void Dropdown::mouse_down(int, int, int) {
         };
     }
     Rect cr = window->content_rect();
-    wm::popup_menu(cr.x + bounds.x, cr.y + bounds.bottom() + 4, items);
+    wm::popup_menu(cr.x + bounds.x, cr.y + bounds.bottom() + 4 - window->view_scroll(), items);
 }

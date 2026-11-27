@@ -1,8 +1,8 @@
 # Writing KleinOS apps
 
-KleinOS is a freestanding C++20 kernel. Each app is a **.dl** dynamic library:
+KleinOS is a freestanding C++20 kernel. Each app is a **.run** file:
 everything in `apps/<Name>/*.cpp` is compiled with `-fPIC` and linked into
-`/System/Apps/<Name>.dl`. At boot, the kernel loads every .dl. Its static
+`/System/Apps/<Name>.run`. At boot, the kernel loads every .run. Its static
 constructors run then, and your `AppRegistrar` adds the app to the Dock,
 Launchpad and Spotlight.
 
@@ -117,3 +117,10 @@ static bool probe(const PciDevice* d) {
 }
 extern "C" { extern const DriverInfo klein_driver; const DriverInfo klein_driver = {KLEIN_DRIVER_ABI, "My Card", ids, 1, probe}; }
 ```
+
+## File dialogs
+
+Use the shared Open / Save As window instead of building your own. Include
+`FileDialog/file_dialog.h`, call `file_dialog::open` or `file_dialog::save`
+with your window and a callback, and call `file_dialog::close_for(this)` from
+your window's destructor. The callback only runs if the user confirms.

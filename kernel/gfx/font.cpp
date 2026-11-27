@@ -38,6 +38,7 @@ struct FontFace {
 };
 
 FontFace g_faces[(int)Font::Count];
+FontFace g_cjk;   // scripts the main faces do not cover
 
 struct CacheEntry {
     uint32_t key_hi;   // font | size | subpixel
@@ -69,14 +70,13 @@ void cache_clear() {
     g_cache_count = 0;
 }
 
-bool load_face(Font f, const char* path) {
+bool init_face(FontFace& ff, const char* path) {
     const uint8_t* data;
     size_t size;
     if (!vfs::read_file(path, &data, &size)) {
         klog("font: missing %s", path);
         return false;
     }
-    FontFace& ff = g_faces[(int)f];
     if (!stbtt_InitFont(&ff.info, data, stbtt_GetFontOffsetForIndex(data, 0))) {
         klog("font: bad font %s", path);
         return false;
@@ -85,6 +85,8 @@ bool load_face(Font f, const char* path) {
     ff.loaded = true;
     return true;
 }
+
+bool load_face(Font f, const char* path) { return init_face(g_faces[(int)f], path); }
 
 }  // namespace
 
@@ -95,6 +97,7 @@ bool font_init() {
     load_face(Font::Medium, "/System/Fonts/NotoSans-Medium.ttf");
     load_face(Font::Bold, "/System/Fonts/NotoSans-Bold.ttf");
     load_face(Font::Mono, "/System/Fonts/DejaVuSansMono.ttf");
+    init_face(g_cjk, "/System/Fonts/NotoSansCJK-Subset.otf");
     klog("font: initialized (%s)", ok ? "ok" : "FAILED");
     return ok;
 }
@@ -133,17 +136,22 @@ const Glyph* font_glyph(Font font, int size, uint32_t cp, int subpixel) {
                     }
                 }
             }
+            FontFace* src = &ff;
+            if (gi == 0 && g_cjk.loaded) {
+                int gi3 = stbtt_FindGlyphIndex(&g_cjk.info, cp);
+                if (gi3) { gi = gi3; src = &g_cjk; scale = scale_for(g_cjk, size); }
+            }
             int adv, lsb;
-            stbtt_GetGlyphHMetrics(&ff.info, gi, &adv, &lsb);
+            stbtt_GetGlyphHMetrics(&src->info, gi, &adv, &lsb);
             int x0, y0, x1, y1;
             float shift = subpixel * 0.25f;
-            stbtt_GetGlyphBitmapBoxSubpixel(&ff.info, gi, scale, scale, shift, 0, &x0, &y0, &x1, &y1);
+            stbtt_GetGlyphBitmapBoxSubpixel(&src->info, gi, scale, scale, shift, 0, &x0, &y0, &x1, &y1);
             int w = x1 - x0, hh = y1 - y0;
             if (w < 0) w = 0;
             if (hh < 0) hh = 0;
             uint8_t* bmp = (uint8_t*)kmalloc(w * hh + 1);
             if (w && hh) {
-                stbtt_MakeGlyphBitmapSubpixel(&ff.info, bmp, w, hh, w, scale, scale, shift, 0, gi);
+                stbtt_MakeGlyphBitmapSubpixel(&src->info, bmp, w, hh, w, scale, scale, shift, 0, gi);
                 for (int i = 0; i < w * hh; i++) bmp[i] = g_coverage_lut[bmp[i]];
             }
             e.used = true;

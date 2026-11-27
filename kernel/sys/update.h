@@ -12,6 +12,7 @@ enum class State { Unsupported, Idle, Checking, UpToDate, Available, Downloading
 void init();                     // after the desktop has started
 State state();
 bool check();                    // ask the server; false if busy or unsupported
+void confirm_by_user();          // call before a restart/shutdown the user chose: keeps a new version
 bool install();                  // download and install the available version
 // Install a full .kupd already in memory (kmalloc); signature checks are the same. Takes the buffer on true.
 bool install_package(uint8_t* data, size_t size);

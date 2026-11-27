@@ -445,18 +445,22 @@ void step_commit() {
     wm::notify("Software Update", body, "settings");
 }
 
+void confirm_slot(const char* why) {
+    g_confirmed = true;
+    g_env_slot = g_slot;
+    g_env_pending[0] = 0;
+    g_env_try = 0;
+    env_write();
+    klog("update: slot %c confirmed (%s)", g_slot, why);
+}
+
 void poll() {
     uint64_t now = timer_ms();
     if (!g_confirmed && now >= kConfirmAfterMs && input_last_ms() >= kConfirmAfterMs) {
         // this slot ran and someone used it after the settling time: make it the default.
         // Without that input a black or frozen screen would count as a good update;
         // restarting before then goes back to the previous version.
-        g_confirmed = true;
-        g_env_slot = g_slot;
-        g_env_pending[0] = 0;
-        g_env_try = 0;
-        env_write();
-        klog("update: slot %c confirmed", g_slot);
+        confirm_slot("used after settling");
     }
     switch (g_step) {
         case Step::Manifest:
@@ -528,6 +532,13 @@ void init() {
     g_state = g_env_try ? State::Ready : State::Idle;
     system_add_poll_hook(poll);
     klog("update: running from slot %c%s", g_slot, g_confirmed ? "" : " (on trial)");
+}
+
+// Restart/Shut Down chosen in the UI: the screen and input demonstrably work, so a
+// version on trial is good. (Before, restarting within 30 s rolled back the update and
+// marked it bad, e.g. when "Forgot password?" restarted right after updating.)
+void confirm_by_user() {
+    if (g_slot && !g_confirmed && input_last_ms() > 0) confirm_slot("restart chosen by the user");
 }
 
 State state() { return g_state; }

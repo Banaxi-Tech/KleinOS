@@ -11,6 +11,7 @@
 #include "drivers/rtc.h"
 #include "sys/session.h"
 #include "sys/sysconfig.h"
+#include "sys/update.h"
 #include "arch/interrupts.h"
 #include "lib/string.h"
 #include "lib/math.h"
@@ -166,14 +167,14 @@ public:
         Hot* restart = new Hot(Rect(sw_ / 2 - 120, sh_ - 150, 120, 74), [](Canvas& c, Rect r) {
             draw_power(c, r, Symbol::Restart, "Restart");
         });
-        restart->on_click = [] { power_reboot(); };
+        restart->on_click = [] { update::confirm_by_user(); power_reboot(); };
         add(restart);
         restart_ = restart;
 
         Hot* shut = new Hot(Rect(sw_ / 2, sh_ - 150, 120, 74), [](Canvas& c, Rect r) {
             draw_power(c, r, Symbol::Power, "Shut Down");
         });
-        shut->on_click = [] { power_shutdown(); };
+        shut->on_click = [] { update::confirm_by_user(); power_shutdown(); };
         add(shut);
         shut_ = shut;
 
@@ -329,6 +330,7 @@ private:
             invalidate();
             return;
         }
+        update::confirm_by_user();
         power_reboot();
     }
 

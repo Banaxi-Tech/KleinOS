@@ -8,6 +8,8 @@
 #include "ui/widgets.h"
 #include "gfx/glass.h"
 #include "gfx/wallpaper.h"
+#include "ui/desktop.h"
+#include "sys/update.h"
 #include "drivers/rtc.h"
 #include "drivers/power.h"
 #include "arch/interrupts.h"
@@ -428,8 +430,8 @@ void logo_menu_items(Vector<MenuItem>& items) {
     String lo = String("Log Out ") + g_user_name + "…";
     add(lo.c_str(), [] { request_logout(); });
     sep();
-    add("Restart…", [] { power_reboot(); });
-    add("Shut Down…", [] { power_shutdown(); });
+    add("Restart…", [] { update::confirm_by_user(); power_reboot(); });
+    add("Shut Down…", [] { update::confirm_by_user(); power_shutdown(); });
 }
 
 void draw_logo(Canvas& s, Rect r, Color c) {
@@ -902,8 +904,8 @@ bool cc_click(int mx, int my) {
         case 6: cc_close(); request_logout(); return true;
         case 7: {
             Vector<MenuItem> items;
-            MenuItem& a = items.emplace(); a.title = "Restart"; a.action = [] { power_reboot(); };
-            MenuItem& b = items.emplace(); b.title = "Shut Down"; b.action = [] { power_shutdown(); };
+            MenuItem& a = items.emplace(); a.title = "Restart"; a.action = [] { update::confirm_by_user(); power_reboot(); };
+            MenuItem& b = items.emplace(); b.title = "Shut Down"; b.action = [] { update::confirm_by_user(); power_shutdown(); };
             MenuItem& c = items.emplace(); c.title = "Log Out"; c.action = [] { request_logout(); };
             popup_menu(t.r.x, t.r.bottom() + 6, items);
             return true;
@@ -977,6 +979,7 @@ void shell_windows_changed() {
 }
 
 void shell_tick(uint64_t now) {
+    desktop_tick();
     if (shell_visible()) {
         DateTime dt = rtc_now();
         if (dt.minute != g_last_minute) {
@@ -1015,7 +1018,7 @@ void shell_glass_rects(Vector<Rect>& out) {
     for (Note& n : g_notes) out.push(n.rect.expand(m).unite(n.rect.offset(380, 0).expand(m)));
 }
 
-void shell_draw_desktop(Canvas& s, Rect clip) {}
+void shell_draw_desktop(Canvas& s, Rect clip) { desktop_draw(s, clip); }
 
 void shell_draw(Canvas& s, Rect clip) {
     if (g_lp_open) return;
@@ -1033,6 +1036,7 @@ void shell_draw_overlays(Canvas& s, Rect clip) {
 
 bool shell_mouse(const InputEvent& ev, uint8_t pressed, uint8_t released) {
     int mx = ev.x, my = ev.y;
+    if (desktop_dragging()) return desktop_mouse(ev, pressed, released);
     // ---- popup menu
     if (g_popup.open) {
         int h = popup_hit(mx, my);
@@ -1151,6 +1155,8 @@ bool shell_mouse(const InputEvent& ev, uint8_t pressed, uint8_t released) {
         return true;
     }
     if (g_dock_pressed >= 0 && released) { g_dock_pressed = -1; damage(g_dock_damage); }
+    if (shell_visible() && !g_lp_open && my >= kMenubarHeight && !g_dock_rect.contains(mx, my) && desktop_mouse(ev, pressed, released))
+        return true;
     return false;
 }
 
@@ -1226,6 +1232,7 @@ bool shell_key(const KeyEvent& e) {
         return true;
     }
     if (g_cc_open && e.key == Key::Escape) { cc_close(); return true; }
+    if (shell_visible() && !active_window() && desktop_key(e)) return true;
     return false;
 }
 

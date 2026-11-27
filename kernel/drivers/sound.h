@@ -26,6 +26,9 @@ uint32_t sound_play_static(const int16_t* data, uint32_t frames, int channels, i
 int16_t* sound_render_piano(float hz, uint32_t frames, float amp = 0.8f);
 void sound_stop(uint32_t id, int fade_ms = 30);
 bool sound_playing(uint32_t id);
+uint32_t sound_position(uint32_t id);                    // frames played so far (0 once it ended)
+// Stop at once, without a fade: afterwards the mixer no longer reads the voice's buffer.
+void sound_kill(uint32_t id);
 void sound_stop_all();
 
 enum class Timbre : uint8_t { Sine, Square, Bell, Piano, Pluck };

@@ -1531,6 +1531,7 @@ void app_open_file(const char* path) {
     if (ext == "png" || ext == "jpg" || ext == "jpeg" || ext == "bmp" || ext == "gif") app = "photos";
     else if (ext == "html" || ext == "htm") app = "browser";
     else if (ext == "dl" || ext == "run") app = "activity";
+    else if (ext == "wav" || ext == "wave" || ext == "mp3" || ext == "ogg" || ext == "flac") app = "music";
     if (vfs::is_dir(path)) app = "files";
     if (!app_find(app)) { notify("Can't open file", path); return; }
     app_launch(app);

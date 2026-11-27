@@ -296,6 +296,17 @@ bool sound_playing(uint32_t id) {
     return false;
 }
 
+uint32_t sound_position(uint32_t id) {
+    for (Voice& v : g_voices) if (v.id == id && v.state == VState::Playing) return v.pos;
+    return 0;
+}
+
+void sound_kill(uint32_t id) {
+    IrqGuard g;
+    for (Voice& v : g_voices)
+        if (v.id == id && v.state == VState::Playing) v.state = VState::Done;   // poll() frees owned buffers
+}
+
 void sound_stop_all() {
     IrqGuard g;
     for (Voice& v : g_voices) if (v.state == VState::Playing) v.fade = v.gain / (int32_t)ms_frames(30) + 1;

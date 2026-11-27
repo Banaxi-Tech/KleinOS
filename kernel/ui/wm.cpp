@@ -111,6 +111,241 @@ void add_damage(Rect r) {
     g_damage.push(r);
 }
 
+GlassStyle overlay_glass(int radius) {
+    GlassStyle s = glass_style_panel(theme().dark);
+    s.blur *= g_glass_k;
+    s.strength *= g_glass_k;
+    if (g_reduce_transparency) s.tint = with_alpha(s.tint, 240);
+    s.radius = radius;
+    return s;
+}
+
+// ----------------------------------------------------------------- snapping
+// Drag a window against the left/right screen edge to fill that half (the corners
+// give quarters), or against the top edge to maximize it. Super+arrows do the same.
+// A tiled window reuses the zoom state: unzoomed_ keeps the size to go back to.
+enum class Snap { None, Left, Right, Max, TopLeft, TopRight, BottomLeft, BottomRight };
+constexpr int kSnapGap = 6;
+constexpr int kSnapCorner = 90;   // px from the top/bottom of the desktop that pick a quarter
+Snap g_snap = Snap::None;         // zone under the pointer while dragging
+Rect g_snap_rect;                 // its preview (screen)
+
+Rect snap_frame(Snap z) {
+    Rect d = wm::desktop_area();
+    int g = kSnapGap;
+    int hw = (d.w - 3 * g) / 2, hh = (d.h - 3 * g) / 2;
+    int lx = d.x + g, rx = d.right() - g - hw, ty = d.y + g, by = d.bottom() - g - hh;
+    switch (z) {
+    case Snap::Left: return Rect(lx, ty, hw, d.h - 2 * g);
+    case Snap::Right: return Rect(rx, ty, hw, d.h - 2 * g);
+    case Snap::Max: return Rect(lx, ty, d.w - 2 * g, d.h - 2 * g);
+    case Snap::TopLeft: return Rect(lx, ty, hw, hh);
+    case Snap::TopRight: return Rect(rx, ty, hw, hh);
+    case Snap::BottomLeft: return Rect(lx, by, hw, hh);
+    case Snap::BottomRight: return Rect(rx, by, hw, hh);
+    default: return Rect();
+    }
+}
+
+bool can_tile(Window* w) { return w && (w->flags() & WF_RESIZABLE) && !(w->flags() & (WF_FULLSCREEN | WF_DIALOG)); }
+
+// Which tile a window currently fills (None if it is free-floating).
+Snap current_snap(Window* w) {
+    if (!w->zoomed_) return Snap::None;
+    Rect f = w->frame();
+    for (int z = (int)Snap::Left; z <= (int)Snap::BottomRight; z++) {
+        Rect t = snap_frame((Snap)z);
+        if (abs(f.x - t.x) <= 2 && abs(f.y - t.y) <= 2 && abs(f.w - t.w) <= 2 && abs(f.h - t.h) <= 2) return (Snap)z;
+    }
+    return Snap::None;
+}
+
+void tile_window(Window* w, Snap z) {
+    if (!can_tile(w) || z == Snap::None) return;
+    if (!w->zoomed_) w->unzoomed_ = Rect(w->x_, w->y_, w->width(), w->height());
+    w->zoomed_ = true;
+    Rect t = snap_frame(z);
+    w->resize(t.w, t.h - kTitlebarHeight);
+    w->move_to(t.x, t.y);
+}
+
+void untile_window(Window* w) {
+    if (!w->zoomed_) return;
+    w->zoomed_ = false;
+    w->resize(w->unzoomed_.w, w->unzoomed_.h);
+    w->move_to(w->unzoomed_.x, w->unzoomed_.y);
+}
+
+Snap snap_zone_at(int x, int y) {
+    Rect d = wm::desktop_area();
+    if (x <= 1) return y < d.y + kSnapCorner ? Snap::TopLeft : y >= d.bottom() - kSnapCorner ? Snap::BottomLeft : Snap::Left;
+    if (x >= W - 2) return y < d.y + kSnapCorner ? Snap::TopRight : y >= d.bottom() - kSnapCorner ? Snap::BottomRight : Snap::Right;
+    if (y <= 1) return Snap::Max;
+    return Snap::None;
+}
+
+int snap_damage_margin() { return glass_margin(overlay_glass(kWindowRadius)) + 40; }
+
+void set_snap(Snap z) {
+    if (z == g_snap) return;
+    if (g_snap != Snap::None) add_damage(g_snap_rect.expand(snap_damage_margin()));
+    g_snap = z;
+    g_snap_rect = snap_frame(z);
+    if (z != Snap::None) add_damage(g_snap_rect.expand(snap_damage_margin()));
+}
+
+void draw_snap_preview(Canvas& s, Rect clip) {
+    Rect p = g_snap_rect;
+    if (!p.expand(40).intersects(clip)) return;
+    s.save();
+    s.clip_to(clip);
+    s.draw_shadow(p, kWindowRadius, 22, rgba(0, 0, 0, theme().dark ? 110 : 55), 0, 8);
+    s.restore();
+    glass_render(s, p, overlay_glass(kWindowRadius), clip);
+    s.save();
+    s.clip_to(clip);
+    s.fill_round_rect(p, kWindowRadius, with_alpha(theme().accent, 46));
+    s.stroke_round_rect(p.expand(-1), kWindowRadius - 1, with_alpha(theme().accent, 170), 1.5f);
+    s.stroke_round_rect(p, kWindowRadius, theme().dark ? rgba(255, 255, 255, 50) : rgba(255, 255, 255, 140), 1.0f);
+    s.restore();
+}
+
+// ----------------------------------------------------------------- window switcher
+// Alt+Tab (or Super+Tab) opens a strip of the open windows, most recent first.
+// Tab / Shift+Tab / arrows move, releasing the modifier switches, Escape cancels.
+struct Switcher {
+    bool open = false;
+    bool shown = false;           // drawn only after a short delay, so a quick Alt+Tab doesn't flash
+    uint8_t mod = 0;              // the modifier that has to stay held
+    uint64_t opened_ms = 0;
+    Vector<Window*> list;
+    int sel = 0;
+    Rect rect;
+};
+Switcher g_sw;
+constexpr int kSwCell = 108, kSwIcon = 68, kSwPad = 14, kSwTitleH = 34;
+constexpr uint64_t kSwShowDelay = 110;
+
+int sw_visible() { int fit = (W - 80 - 2 * kSwPad) / kSwCell; return kmax(1, kmin((int)g_sw.list.size(), fit)); }
+int sw_first() { int v = sw_visible(); return g_sw.sel >= v ? g_sw.sel - v + 1 : 0; }
+
+void sw_layout() {
+    int v = sw_visible();
+    int w = v * kSwCell + 2 * kSwPad, h = kSwCell + kSwTitleH + 2 * kSwPad - 6;
+    g_sw.rect = Rect((W - w) / 2, (H - h) / 2, w, h);
+}
+
+void sw_damage() {
+    if (!g_sw.shown) return;
+    sw_layout();
+    add_damage(g_sw.rect.expand(glass_margin(overlay_glass(22)) + 50));
+}
+
+void sw_close() {
+    sw_damage();
+    g_sw.open = g_sw.shown = false;
+    g_sw.list.clear();
+}
+
+void sw_open(uint8_t mod, bool backwards) {
+    g_sw.list.clear();
+    for (size_t i = g_windows.size(); i > 0; i--) {      // visible windows, top first
+        Window* w = g_windows[i - 1];
+        if (!w->closing_ && !w->minimized_) g_sw.list.push(w);
+    }
+    for (size_t i = g_windows.size(); i > 0; i--) {      // then minimized ones
+        Window* w = g_windows[i - 1];
+        if (!w->closing_ && w->minimized_) g_sw.list.push(w);
+    }
+    int n = (int)g_sw.list.size();
+    if (!n) return;
+    g_sw.open = true;
+    g_sw.shown = false;
+    g_sw.mod = mod;
+    g_sw.opened_ms = timer_ms();
+    bool top_is_active = g_active && g_sw.list[0] == g_active;
+    if (backwards) g_sw.sel = n - 1;
+    else g_sw.sel = top_is_active && n > 1 ? 1 : 0;
+}
+
+void sw_step(int dir) {
+    int n = (int)g_sw.list.size();
+    if (!n) return;
+    sw_damage();
+    g_sw.sel = (g_sw.sel + dir + n) % n;
+    if (!g_sw.shown) g_sw.shown = true;   // second Tab: show right away
+    sw_damage();
+}
+
+void sw_commit() {
+    Window* w = g_sw.sel >= 0 && g_sw.sel < (int)g_sw.list.size() ? g_sw.list[g_sw.sel] : nullptr;
+    sw_close();
+    if (!w) return;
+    if (w->minimized_) wm::restore(w);
+    wm::focus(w);
+}
+
+int sw_hit(int x, int y) {
+    if (!g_sw.shown) return -1;
+    sw_layout();
+    Rect r = g_sw.rect;
+    int first = sw_first(), v = sw_visible();
+    for (int i = 0; i < v; i++) {
+        Rect cell(r.x + kSwPad + i * kSwCell, r.y + kSwPad, kSwCell, kSwCell);
+        if (cell.contains(x, y)) return first + i;
+    }
+    return -1;
+}
+
+void draw_switcher(Canvas& s, Rect clip) {
+    if (!g_sw.open || !g_sw.shown) return;
+    sw_layout();
+    Rect p = g_sw.rect;
+    if (!p.expand(50).intersects(clip)) return;
+    GlassStyle gs = overlay_glass(22);
+    s.save();
+    s.clip_to(clip);
+    s.draw_shadow(p, 22, 30, rgba(0, 0, 0, theme().dark ? 140 : 70), 0, 10);
+    s.restore();
+    glass_render(s, p, gs, clip);
+    s.save();
+    s.clip_to(clip);
+    s.stroke_round_rect(p, 22, theme().dark ? rgba(255, 255, 255, 46) : rgba(255, 255, 255, 130), 1.0f);
+    int first = sw_first(), v = sw_visible();
+    for (int i = 0; i < v; i++) {
+        int idx = first + i;
+        Window* w = g_sw.list[idx];
+        Rect cell(p.x + kSwPad + i * kSwCell, p.y + kSwPad, kSwCell, kSwCell);
+        if (idx == g_sw.sel) {
+            s.fill_round_rect(cell.expand(-3), 16, theme().dark ? rgba(255, 255, 255, 44) : rgba(0, 0, 0, 30));
+            s.stroke_round_rect(cell.expand(-3), 16, theme().dark ? rgba(255, 255, 255, 60) : rgba(0, 0, 0, 22), 1.0f);
+        }
+        Rect ir(cell.x + (kSwCell - kSwIcon) / 2, cell.y + (kSwCell - kSwIcon) / 2 - 2, kSwIcon, kSwIcon);
+        const AppInfo* a = app_find(w->app_id());
+        if (a && a->draw_icon) {
+            a->draw_icon(s, ir);
+        } else {
+            s.fill_round_rect(ir, kSwIcon * 0.225f, theme().accent);
+            char letter[2] = {w->title()[0] ? w->title()[0] : '?', 0};
+            s.draw_text_in(ir, letter, theme().accent_text, 32, Font::Bold, Align::Center);
+        }
+        if (w->minimized_)   // dimmed, like a window that's tucked away
+            s.fill_round_rect(ir, kSwIcon * 0.225f, theme().dark ? rgba(30, 30, 34, 120) : rgba(255, 255, 255, 120));
+        // a dot per window of the same app would crowd it; mark the minimized ones instead
+        if (w->minimized_) s.fill_round_rect(Rect(cell.x + kSwCell / 2 - 9, cell.bottom() - 12, 18, 3), 1.5f, theme().text_secondary);
+    }
+    if (first > 0) s.draw_text_in(Rect(p.x + 2, p.y + kSwPad, 14, kSwCell), "\xE2\x80\xB9", theme().text_secondary, 18, Font::Bold, Align::Center);
+    if (first + v < (int)g_sw.list.size())
+        s.draw_text_in(Rect(p.right() - 16, p.y + kSwPad, 14, kSwCell), "\xE2\x80\xBA", theme().text_secondary, 18, Font::Bold, Align::Center);
+    Window* cur = g_sw.list[g_sw.sel];
+    const AppInfo* ca = app_find(cur->app_id());
+    const char* title = cur->title()[0] ? cur->title() : ca ? ca->name : "Window";
+    String label = title;
+    if (ca && strcmp(ca->name, title) != 0) label = String(ca->name) + " \xE2\x80\x94 " + title;
+    s.draw_text_in(Rect(p.x + 16, p.y + kSwPad + kSwCell - 2, p.w - 32, kSwTitleH - 8), label.c_str(), theme().text, 14, Font::Medium, Align::Center);
+    s.restore();
+}
+
 // Grow damage to cover glass surfaces they touch, merge overlaps.
 void normalize_damage() {
     Vector<Rect> glass;
@@ -121,6 +356,8 @@ void normalize_damage() {
             owner.push(w);
         }
     shell_glass_rects(glass);
+    if (g_snap != Snap::None) glass.push(g_snap_rect.expand(glass_margin(overlay_glass(kWindowRadius))));
+    if (g_sw.shown) { sw_layout(); glass.push(g_sw.rect.expand(glass_margin(overlay_glass(22)))); }
     for (int iter = 0; iter < 6; iter++) {
         bool changed = false;
         for (Rect& d : g_damage)
@@ -297,12 +534,16 @@ void compose_region(Rect r) {
     s.blit(*g_wallpaper, 0, 0);
     shell_draw_desktop(s, r);
     s.restore();
+    bool preview_drawn = false;
     for (Window* w : g_windows) {
         if (w->minimized_ || w->closing_) continue;
+        if (g_snap != Snap::None && w == g_drag_win) { draw_snap_preview(s, r); preview_drawn = true; }
         compose_window(s, w, r);
     }
+    if (g_snap != Snap::None && !preview_drawn) draw_snap_preview(s, r);
     if (g_shell_visible) shell_draw(s, r);
     shell_draw_overlays(s, r);
+    draw_switcher(s, r);
 }
 
 void present(Rect r) {
@@ -381,6 +622,13 @@ void handle_mouse(const InputEvent& ev) {
     uint8_t pressed = ev.buttons & ~g_buttons;
     uint8_t released = g_buttons & ~ev.buttons;
     g_buttons = ev.buttons;
+
+    if (g_sw.open) {
+        int hit = sw_hit(ev.x, ev.y);
+        if (hit >= 0 && hit != g_sw.sel && (old.x != ev.x || old.y != ev.y)) { sw_damage(); g_sw.sel = hit; sw_damage(); }
+        if (pressed) { if (hit >= 0) { g_sw.sel = hit; sw_commit(); } else sw_close(); }
+        return;
+    }
 
     // shell gets first pick (menus, dock, menubar, popups)
     if (shell_mouse(ev, pressed, released)) {
@@ -479,10 +727,16 @@ void handle_mouse(const InputEvent& ev) {
             g_drag_win->on_mouse_up(ev.x - cr.x, ev.y - cr.y + g_drag_win->view_scroll(), button);
         }
         if (g_drag == Drag::Move && g_drag_win) {
-            // keep titlebar reachable
-            Rect d = desktop_area();
             Window* w = g_drag_win;
-            if (w->y_ < d.y) w->move_to(w->x_, d.y);
+            Snap z = g_snap;
+            set_snap(Snap::None);
+            if (z != Snap::None) {
+                tile_window(w, z);
+            } else {
+                // keep titlebar reachable
+                Rect d = desktop_area();
+                if (w->y_ < d.y) w->move_to(w->x_, d.y);
+            }
         }
         if (!g_buttons) { g_drag = Drag::None; g_drag_win = nullptr; }
         return;
@@ -499,6 +753,7 @@ void handle_mouse(const InputEvent& ev) {
             g_drag_dx = g_drag_win->width() / 2;
         }
         g_drag_win->move_to(ev.x - g_drag_dx, ny);
+        set_snap(can_tile(g_drag_win) ? snap_zone_at(ev.x, ev.y) : Snap::None);
         return;
     }
     if (g_drag == Drag::Resize && g_drag_win) {
@@ -539,7 +794,24 @@ void handle_mouse(const InputEvent& ev) {
 }
 
 void handle_key(const KeyEvent& e) {
+    if (g_sw.open) {
+        if (!(e.mods & g_sw.mod)) { sw_commit(); return; }   // modifier let go
+        if (!e.pressed) return;
+        switch (e.key) {
+        case Key::Tab: sw_step(e.shift() ? -1 : 1); break;
+        case Key::Right: case Key::Down: sw_step(1); break;
+        case Key::Left: case Key::Up: sw_step(-1); break;
+        case Key::Enter: sw_commit(); break;
+        case Key::Escape: sw_close(); break;
+        default: break;
+        }
+        return;
+    }
     if (!e.pressed) return;
+    if (e.key == Key::Tab && (e.alt() || e.super())) {
+        sw_open(e.alt() ? MOD_ALT : MOD_SUPER, e.shift());
+        return;
+    }
     if (shell_key(e)) return;
     // global shortcuts
     if (e.cmd() && e.key == Key::Char) {
@@ -553,10 +825,36 @@ void handle_key(const KeyEvent& e) {
         }
         if (ch == 'm' && g_active && e.super()) { minimize(g_active); return; }
     }
-    if (e.alt() && e.key == Key::Tab) {
-        // cycle to the bottom-most visible window
-        for (Window* w : g_windows)
-            if (!w->minimized_ && !w->closing_ && w != g_active && !(w->flags() & WF_FULLSCREEN)) { focus(w); break; }
+    // Super+arrows: tile the active window (halves, quarters, maximize), Super+Down undoes / minimizes
+    if (e.super() && !e.ctrl() && !e.alt() && can_tile(g_active) &&
+        (e.key == Key::Left || e.key == Key::Right || e.key == Key::Up || e.key == Key::Down)) {
+        Window* w = g_active;
+        Snap cur = current_snap(w), to = Snap::None;
+        bool untile = false;
+        switch (e.key) {
+        case Key::Left:
+            if (cur == Snap::Right || cur == Snap::TopRight || cur == Snap::BottomRight) untile = true;
+            else to = cur == Snap::TopLeft || cur == Snap::BottomLeft ? cur : Snap::Left;
+            break;
+        case Key::Right:
+            if (cur == Snap::Left || cur == Snap::TopLeft || cur == Snap::BottomLeft) untile = true;
+            else to = cur == Snap::TopRight || cur == Snap::BottomRight ? cur : Snap::Right;
+            break;
+        case Key::Up:
+            to = cur == Snap::Left ? Snap::TopLeft : cur == Snap::Right ? Snap::TopRight :
+                 cur == Snap::BottomLeft ? Snap::Left : cur == Snap::BottomRight ? Snap::Right : Snap::Max;
+            break;
+        default:   // Down
+            if (cur == Snap::Left) to = Snap::BottomLeft;
+            else if (cur == Snap::Right) to = Snap::BottomRight;
+            else if (cur == Snap::TopLeft) to = Snap::Left;
+            else if (cur == Snap::TopRight) to = Snap::Right;
+            else if (w->zoomed_) untile = true;
+            else if (!(w->flags() & WF_NO_MINIMIZE)) { minimize(w); return; }
+            break;
+        }
+        if (untile) untile_window(w);
+        else if (to != cur) tile_window(w, to);
         return;
     }
     if (g_active) g_active->on_key(e);
@@ -612,6 +910,13 @@ void remove_window(Window* w) {
     if (g_drag_win == w) { g_drag_win = nullptr; g_drag = Drag::None; }
     if (g_last_click_win == w) g_last_click_win = nullptr;
     if (g_hover_traffic_win == w) g_hover_traffic_win = nullptr;
+    if (g_drag_win == nullptr) set_snap(Snap::None);
+    if (g_sw.open) {
+        for (size_t i = 0; i < g_sw.list.size(); i++)
+            if (g_sw.list[i] == w) { g_sw.list.remove(i); if (g_sw.sel > (int)i) g_sw.sel--; break; }
+        if (g_sw.list.empty()) sw_close();
+        else { if (g_sw.sel >= (int)g_sw.list.size()) g_sw.sel = 0; damage_all(); }
+    }
     if (g_active == w) {
         g_active = nullptr;
         for (size_t i = g_windows.size(); i > 0; i--)
@@ -660,17 +965,9 @@ void restore(Window* w) {
 
 void toggle_zoom(Window* w) {
     if (!(w->flags() & WF_RESIZABLE)) return;
-    Rect d = desktop_area();
-    if (w->zoomed_) {
-        w->zoomed_ = false;
-        w->resize(w->unzoomed_.w, w->unzoomed_.h);
-        w->move_to(w->unzoomed_.x, w->unzoomed_.y);
-    } else {
-        w->unzoomed_ = Rect(w->x_, w->y_, w->width(), w->height());
-        w->zoomed_ = true;
-        w->move_to(d.x + 6, d.y + 6);
-        w->resize(d.w - 12, d.h - 12 - kTitlebarHeight);
-    }
+    Snap cur = current_snap(w);
+    if (w->zoomed_ && (cur == Snap::Max || cur == Snap::None)) untile_window(w);
+    else tile_window(w, Snap::Max);    // a half/quarter tile grows to full, keeping its old free size
 }
 
 void damage(Rect r) { add_damage(r); }
@@ -717,6 +1014,7 @@ void frame() {
         else handle_key(ev.key);
     }
     if (have_motion) handle_mouse(motion);
+    if (g_sw.open && !g_sw.shown && now - g_sw.opened_ms >= kSwShowDelay) { g_sw.shown = true; sw_damage(); }
     // deferred work (window deletion etc.)
     if (!g_deferred.empty()) {
         Vector<Func<void()>> work = std::move(g_deferred);

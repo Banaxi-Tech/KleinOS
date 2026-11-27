@@ -397,7 +397,7 @@ void rebuild_menubar() {
     MenuItem& hs = help.items.emplace(); hs.title = "KleinOS Help";
     hs.action = [] { if (!app_launch("help")) notify("KleinOS Help", "Press Super+Space to search, drag windows by their glass title bar."); };
     MenuItem& kb = help.items.emplace(); kb.title = "Keyboard Shortcuts";
-    kb.action = [] { notify("Shortcuts", "Super+Space Spotlight · F4 Launchpad · Super+W close · Super+Q quit · Alt+Tab switch"); };
+    kb.action = [] { notify("Shortcuts", "Super+Space Spotlight · F4 Launchpad · Alt+Tab switch windows · Super+←/→/↑/↓ tile · Super+W close · Super+Q quit"); };
 
     // layout
     int x = 44;

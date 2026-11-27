@@ -10,7 +10,7 @@
 struct UserAccount {
     char full_name[64];
     char login[32];
-    char password_hash[65];   // hex SHA-256 of (login + ":" + password), empty = no password
+    char password_hash[65];   // hex SHA-256 of ("KleinOS-salt:" + login + ":" + password), empty = no password
     uint8_t avatar_color;     // index into a palette
     uint8_t is_admin;
     uint8_t pad[6];

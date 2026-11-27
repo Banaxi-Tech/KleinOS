@@ -28,6 +28,9 @@ static void put_text(int x, int y, const char* s, uint32_t color, int scale) {
 // Where kernel stacks can live, to keep the frame-pointer walk from chasing garbage.
 #if defined(__aarch64__)
 static constexpr uintptr_t kStackLo = 0x40000000ull, kStackHi = 0x8000000000ull;
+#elif defined(__i386__)
+// 0x100000000 does not fit a 32-bit uintptr_t (it became 0 and no backtrace was ever printed).
+static constexpr uintptr_t kStackLo = 0x100000, kStackHi = 0xFFFFF000u;
 #else
 static constexpr uintptr_t kStackLo = 0x100000, kStackHi = 0x100000000ull;
 #endif

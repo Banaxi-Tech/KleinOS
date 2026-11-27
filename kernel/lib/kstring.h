@@ -46,7 +46,7 @@ public:
     char& operator[](size_t i) { return data_[i]; }
 
     void reserve(size_t n) {
-        if (n + 1 <= cap_) return;
+        if (n < cap_) return;  // (not n + 1 <= cap_: that overflows for n = SIZE_MAX)
         size_t nc = cap_ ? cap_ : 16;
         while (nc < n + 1) nc *= 2;
         char* nd = (char*)kmalloc(nc);
@@ -56,8 +56,16 @@ public:
         cap_ = nc;
     }
     String& append(const char* s, size_t n) {
-        reserve(len_ + n);
-        memcpy(data_ + len_, s, n);
+        if (!n) return *this;
+        // s may point into our own buffer (x += x), which reserve() can free.
+        if (data_ && s >= data_ && s < data_ + cap_) {
+            size_t off = (size_t)(s - data_);
+            reserve(len_ + n);
+            s = data_ + off;
+        } else {
+            reserve(len_ + n);
+        }
+        memmove(data_ + len_, s, n);
         len_ += n;
         data_[len_] = 0;
         return *this;
@@ -73,6 +81,12 @@ public:
 
     void insert(size_t pos, const char* s, size_t n) {
         if (pos > len_) pos = len_;
+        if (!n) return;
+        if (data_ && s >= data_ && s < data_ + cap_) {  // inserting part of ourselves: copy it out first
+            String tmp(s, n);
+            insert(pos, tmp.data_, n);
+            return;
+        }
         reserve(len_ + n);
         memmove(data_ + pos + n, data_ + pos, len_ - pos + 1);
         memcpy(data_ + pos, s, n);
@@ -91,7 +105,7 @@ public:
         return String(data_ + pos, n);
     }
     long find(const char* needle, size_t from = 0) const {
-        if (from > len_) return -1;
+        if (from > len_ || !data_) return -1;
         const char* p = strstr(data_ + from, needle);
         return p ? (long)(p - data_) : -1;
     }

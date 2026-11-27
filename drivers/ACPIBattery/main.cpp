@@ -889,7 +889,9 @@ const u8* find_rsdp() {
         }
         return nullptr;
     };
-    uintptr_t ebda = (uintptr_t)*(volatile uint16_t*)0x40E << 4;
+    uintptr_t bda_ebda = 0x40E;               // BIOS data area: EBDA segment
+    asm("" : "+r"(bda_ebda));                 // keep GCC from treating a fixed low address as a null deref
+    uintptr_t ebda = (uintptr_t)*(volatile uint16_t*)bda_ebda << 4;
     const u8* found = ebda ? scan(ebda, ebda + 1024) : nullptr;
     return found ? found : scan(0xE0000, 0x100000);
 }

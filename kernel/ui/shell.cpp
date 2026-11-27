@@ -47,7 +47,6 @@ int g_dock_hover_index = -1;
 int g_dock_mouse_x;
 Rect g_dock_rect;           // glass pill
 Rect g_dock_damage;         // pill + magnification overhang
-uint64_t g_dock_press_ms;
 int g_dock_pressed = -1;
 
 // ---------------------------------------------------------------- menubar
@@ -88,7 +87,6 @@ int g_spot_sel;
 
 // ---------------------------------------------------------------- launchpad
 bool g_lp_open;
-float g_lp_anim;            // 0..1
 String g_lp_query;
 int g_lp_hover = -1;
 Vector<const AppInfo*> g_lp_apps;
@@ -97,7 +95,6 @@ Vector<Rect> g_lp_rects;
 // ---------------------------------------------------------------- control center
 bool g_cc_open;
 Rect g_cc_panel;
-Slider* g_cc_slider_dummy;
 int g_cc_drag = -1;         // which slider is being dragged
 float g_cc_volume = 0.6f;
 bool g_dnd;

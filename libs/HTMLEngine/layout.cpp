@@ -1231,11 +1231,11 @@ int layout_flex(Ctx& cx, Node* n, int x, int y, int width, int fixed_h, const St
                 int deficit = total - fixed_h;
                 int shrinkable = 0;
                 for (size_t i = 0; i < kids.size(); i++)
-                    if (kids[i]->type == Node::Element && (kids[i]->style.overflow_scroll || kids[i]->style.overflow_hidden || kids[i]->style.flex_shrink > 0 && kids[i]->style.flex_grow > 0))
+                    if (kids[i]->type == Node::Element && (kids[i]->style.overflow_scroll || kids[i]->style.overflow_hidden || (kids[i]->style.flex_shrink > 0 && kids[i]->style.flex_grow > 0)))
                         shrinkable += nat[i];
                 for (size_t i = 0; i < kids.size() && shrinkable > 0; i++) {
                     Node* c = kids[i];
-                    if (!(c->type == Node::Element && (c->style.overflow_scroll || c->style.overflow_hidden || c->style.flex_shrink > 0 && c->style.flex_grow > 0))) continue;
+                    if (!(c->type == Node::Element && (c->style.overflow_scroll || c->style.overflow_hidden || (c->style.flex_shrink > 0 && c->style.flex_grow > 0)))) continue;
                     int cut = (int)((long long)deficit * nat[i] / shrinkable);
                     forced[i] = kmax(20, nat[i] - cut - c->style.padding[0] - c->style.padding[2]);
                 }

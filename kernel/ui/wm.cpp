@@ -59,7 +59,6 @@ Rect g_drag_start;
 uint64_t g_last_click_ms;
 Point g_last_click_pos;
 Window* g_last_click_win;
-int g_hover_traffic = -1;    // which window's traffic lights are hovered
 Window* g_hover_traffic_win;
 
 // cursor

@@ -1475,7 +1475,7 @@ static void ua_defaults(Node* n, Style& s, const Style& parent) {
     if (t == "html" || t == "body" || t == "div" || t == "section" || t == "article" || t == "header" || t == "footer" ||
         t == "nav" || t == "main" || t == "aside" || t == "form" || t == "fieldset" || t == "figure" || t == "address" ||
         t == "details" || t == "summary" || t == "center" || t == "hgroup" || t == "noscript" || t == "figcaption" || t == "dl" ||
-        t == "legend" || t == "caption" || t == "search" || t == "picture" && false) {
+        t == "legend" || t == "caption" || t == "search") {
         s.display = Style::Block;
         if (t == "body") { s.margin[0] = s.margin[1] = s.margin[2] = s.margin[3] = 8; }
         if (t == "center") s.text_align = Style::Center;

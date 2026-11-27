@@ -27,6 +27,9 @@ void toggle_zoom(Window* w);
 void damage(Rect screen_rect);
 void damage_all();
 
+// Save the screen (or the active window) to ~/Pictures as a BMP. delay_ms lets a menu close first.
+void take_screenshot(bool window_only = false, int delay_ms = 0);
+
 // Shell
 void set_shell_visible(bool visible);   // menubar + dock (off for installer/login)
 bool shell_visible();

@@ -19,6 +19,8 @@
 #include "arch/cpu.h"
 #include "lib/log.h"
 #include "lib/math.h"
+#include "fs/vfs.h"
+#include "drivers/rtc.h"
 
 namespace wm {
 
@@ -118,6 +120,55 @@ GlassStyle overlay_glass(int radius) {
     if (g_reduce_transparency) s.tint = with_alpha(s.tint, 240);
     s.radius = radius;
     return s;
+}
+
+// ----------------------------------------------------------------- screenshots
+// Super+Shift+3: whole screen, Super+Shift+4: the active window. Saved as BMP to
+// ~/Pictures (Photos picks them up), with a white flash and a notification.
+uint64_t g_flash_ms;              // when the capture flash started (0 = none)
+constexpr uint64_t kFlashMs = 280;
+uint64_t g_shot_at_ms;            // delayed capture (from a menu: let it close first)
+bool g_shot_window;
+
+bool write_bmp(const Canvas& img, Rect r, const char* path) {
+    r = r.intersect(Rect(0, 0, img.width(), img.height()));
+    if (r.empty()) return false;
+    uint32_t row_bytes = ((r.w * 3 + 3) / 4) * 4, data = row_bytes * (uint32_t)r.h, total = 54 + data;
+    uint8_t* buf = (uint8_t*)kmalloc(total);
+    if (!buf) return false;
+    memset(buf, 0, 54);
+    auto put = [&](int off, uint32_t v, int n) { for (int i = 0; i < n; i++) buf[off + i] = (v >> (8 * i)) & 0xFF; };
+    buf[0] = 'B'; buf[1] = 'M';
+    put(2, total, 4); put(10, 54, 4); put(14, 40, 4); put(18, (uint32_t)r.w, 4); put(22, (uint32_t)r.h, 4);
+    put(26, 1, 2); put(28, 24, 2); put(34, data, 4); put(38, 2835, 4); put(42, 2835, 4);
+    for (int y = 0; y < r.h; y++) {
+        const uint32_t* src = img.row(r.bottom() - 1 - y) + r.x;
+        uint8_t* d = buf + 54 + (size_t)y * row_bytes;
+        for (int x = 0; x < r.w; x++) { uint32_t p = src[x]; d[x * 3] = p; d[x * 3 + 1] = p >> 8; d[x * 3 + 2] = p >> 16; }
+        for (uint32_t i = r.w * 3; i < row_bytes; i++) d[i] = 0;
+    }
+    bool ok = vfs::write_file(path, buf, total);
+    kfree(buf);
+    return ok;
+}
+
+void capture_now(bool window_only) {
+    Rect r(0, 0, W, H);
+    if (window_only) {
+        if (!g_active || g_active->minimized_) { wm::notify("Screenshot", "No window is active to capture."); return; }
+        r = g_active->frame();
+    }
+    DateTime t = rtc_now();
+    const char* login = shell_user_login();
+    char path[192];
+    snprintf(path, sizeof(path), "/Users/%s/Pictures/Screenshot %04d-%02d-%02d at %02d.%02d.%02d.bmp",
+             login && *login ? login : "guest", t.year, t.month, t.day, t.hour, t.minute, t.second);
+    if (!write_bmp(*g_front, r, path)) { wm::notify("Screenshot", "Couldn't save the screenshot."); return; }
+    klog("wm: screenshot %dx%d -> %s", r.w, r.h, path);
+    g_flash_ms = timer_ms();
+    add_damage(window_only ? r : Rect(0, 0, W, H));
+    const char* name = strrchr(path, '/') + 1;
+    wm::notify(window_only ? "Window captured" : "Screenshot saved", name, "photos");
 }
 
 // ----------------------------------------------------------------- snapping
@@ -544,6 +595,16 @@ void compose_region(Rect r) {
     if (g_shell_visible) shell_draw(s, r);
     shell_draw_overlays(s, r);
     draw_switcher(s, r);
+    if (g_flash_ms) {
+        uint64_t age = timer_ms() - g_flash_ms;
+        if (age < kFlashMs) {
+            float k = 1.0f - (float)age / kFlashMs;
+            s.save();
+            s.clip_to(r);
+            s.fill_rect(r, rgba(255, 255, 255, (int)(200 * k * k)));
+            s.restore();
+        }
+    }
 }
 
 void present(Rect r) {
@@ -812,6 +873,12 @@ void handle_key(const KeyEvent& e) {
         sw_open(e.alt() ? MOD_ALT : MOD_SUPER, e.shift());
         return;
     }
+    // Super/Ctrl+Shift+3 and +4 (the shifted characters depend on the layout)
+    if (e.cmd() && e.shift() && e.key == Key::Char) {
+        uint32_t c = e.ch;
+        if (c == '3' || c == '#' || c == 0xA3 || c == 0xA7) { capture_now(false); return; }
+        if (c == '4' || c == '$') { capture_now(true); return; }
+    }
     if (shell_key(e)) return;
     // global shortcuts
     if (e.cmd() && e.key == Key::Char) {
@@ -971,6 +1038,11 @@ void toggle_zoom(Window* w) {
 }
 
 void damage(Rect r) { add_damage(r); }
+void take_screenshot(bool window_only, int delay_ms) {
+    if (delay_ms <= 0) { capture_now(window_only); return; }
+    g_shot_window = window_only;
+    g_shot_at_ms = timer_ms() + delay_ms;
+}
 void damage_all() { g_damage.clear(); g_damage.push(Rect(0, 0, W, H)); }
 
 void set_shell_visible(bool v) { g_shell_visible = v; damage_all(); }
@@ -1014,7 +1086,18 @@ void frame() {
         else handle_key(ev.key);
     }
     if (have_motion) handle_mouse(motion);
-    if (g_sw.open && !g_sw.shown && now - g_sw.opened_ms >= kSwShowDelay) { g_sw.shown = true; sw_damage(); }
+    // Input handlers stamp things with timer_ms() (notifications, the switcher, screenshots);
+    // an older `now` would make their age negative, i.e. huge as unsigned, and expire them at once.
+    now = timer_ms();
+    {
+        uint64_t t = now;
+        if (g_sw.open && !g_sw.shown && t - g_sw.opened_ms >= kSwShowDelay) { g_sw.shown = true; sw_damage(); }
+        if (g_shot_at_ms && t >= g_shot_at_ms) { g_shot_at_ms = 0; capture_now(g_shot_window); }
+        if (g_flash_ms) {
+            add_damage(Rect(0, 0, W, H));
+            if (t - g_flash_ms >= kFlashMs + 20) g_flash_ms = 0;
+        }
+    }
     // deferred work (window deletion etc.)
     if (!g_deferred.empty()) {
         Vector<Func<void()>> work = std::move(g_deferred);

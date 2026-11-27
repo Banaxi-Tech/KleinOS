@@ -397,7 +397,7 @@ void rebuild_menubar() {
     MenuItem& hs = help.items.emplace(); hs.title = "KleinOS Help";
     hs.action = [] { if (!app_launch("help")) notify("KleinOS Help", "Press Super+Space to search, drag windows by their glass title bar."); };
     MenuItem& kb = help.items.emplace(); kb.title = "Keyboard Shortcuts";
-    kb.action = [] { notify("Shortcuts", "Super+Space Spotlight · F4 Launchpad · Alt+Tab switch windows · Super+←/→/↑/↓ tile · Super+W close · Super+Q quit"); };
+    kb.action = [] { notify("Shortcuts", "Super+Space Spotlight · F4 Launchpad · Alt+Tab switch windows · Super+←/→/↑/↓ tile · Super+Shift+3/4 screenshot · Super+W close · Super+Q quit"); };
 
     // layout
     int x = 44;
@@ -419,6 +419,8 @@ void logo_menu_items(Vector<MenuItem>& items) {
     sep();
     add("System Settings…", [] { app_launch("settings"); });
     add("App Library", [] { open_launchpad(); }, "F4");
+    add("Take Screenshot", [] { take_screenshot(false, 250); }, "Super+Shift+3");
+    add("Capture Window", [] { take_screenshot(true, 250); }, "Super+Shift+4");
     sep();
     add("Force Quit…", [] { app_launch("activity"); });
     sep();

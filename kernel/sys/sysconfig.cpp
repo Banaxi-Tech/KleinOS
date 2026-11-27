@@ -128,6 +128,87 @@ PasswordChangeResult sysconfig_change_password(const char* login, const char* cu
     return PasswordChangeResult::Unavailable;
 }
 
+// ---------------------------------------------------------------- password recovery
+static const char kRecoveryPath[] = "/KleinOS/recovery.req";
+static char g_recovery_login[32];
+
+static UserAccount* find_account(const char* login) {
+    for (uint32_t i = 0; i < g_cfg.user_count && i < 4; i++)
+        if (!strcmp(g_cfg.users[i].login, login)) return &g_cfg.users[i];
+    return nullptr;
+}
+
+static void reset_notice_path(const char* login, char* out, size_t size) {
+    snprintf(out, size, "/KleinOS/reset-%s.txt", login);
+}
+
+bool sysconfig_request_recovery(const char* login) {
+    if (g_drive < 0 || !login || !find_account(login)) return false;
+    bool ok = fat32::write_file(kRecoveryPath, login, strlen(login), rtc_unix_time()) && fat32::flush();
+    klog("sysconfig: recovery restart requested for %s%s", login, ok ? "" : " (could not be saved)");
+    return ok;
+}
+
+void sysconfig_take_recovery_request() {
+    g_recovery_login[0] = 0;
+    if (g_drive < 0) return;
+    uint8_t* data = nullptr;
+    size_t size = 0;
+    if (!fat32::read_file(kRecoveryPath, &data, &size)) return;
+    char login[32];
+    size_t n = size < sizeof(login) - 1 ? size : sizeof(login) - 1;
+    memcpy(login, data, n);
+    login[n] = 0;
+    kfree(data);
+    fat32::remove(kRecoveryPath);   // one boot only, whatever happens next
+    fat32::flush();
+    if (!find_account(login)) return;
+    strlcpy(g_recovery_login, login, sizeof(g_recovery_login));
+    klog("sysconfig: recovery boot for %s", login);
+}
+
+const char* sysconfig_recovery_login() { return g_recovery_login; }
+void sysconfig_recovery_cancel() { g_recovery_login[0] = 0; }
+
+bool sysconfig_recovery_reset(const char* new_password) {
+    UserAccount* u = g_recovery_login[0] ? find_account(g_recovery_login) : nullptr;
+    if (!u) return false;
+    char previous[65];
+    memcpy(previous, u->password_hash, sizeof(previous));
+    memset(u->password_hash, 0, sizeof(u->password_hash));
+    sysconfig_hash_password(u->login, new_password, u->password_hash);
+    bool saved = sysconfig_save();
+    if (!saved) memcpy(u->password_hash, previous, sizeof(previous));
+    memset(previous, 0, sizeof(previous));
+    if (!saved) return false;
+    char path[64], when[24];
+    reset_notice_path(u->login, path, sizeof(path));
+    int n = snprintf(when, sizeof(when), "%llu", (unsigned long long)rtc_unix_time());
+    fat32::write_file(path, when, n, rtc_unix_time());
+    fat32::flush();
+    klog("sysconfig: password of %s reset in recovery", u->login);
+    g_recovery_login[0] = 0;   // one reset per recovery boot
+    return true;
+}
+
+bool sysconfig_take_reset_notice(const char* login, uint64_t* when) {
+    if (g_drive < 0 || !login) return false;
+    char path[64];
+    reset_notice_path(login, path, sizeof(path));
+    uint8_t* data = nullptr;
+    size_t size = 0;
+    if (!fat32::read_file(path, &data, &size)) return false;
+    char buf[24];
+    size_t n = size < sizeof(buf) - 1 ? size : sizeof(buf) - 1;
+    memcpy(buf, data, n);
+    buf[n] = 0;
+    kfree(data);
+    fat32::remove(path);
+    fat32::flush();
+    if (when) *when = strtoul(buf, nullptr, 10);
+    return true;
+}
+
 // ---------------------------------------------------------------- user data
 // /Users lives on disk as ordinary files and in RAM while running.
 static constexpr size_t kMaxFileInRam = 32u << 20;

@@ -113,6 +113,14 @@ void draw_power(Canvas& c, Rect r, Symbol sym, const char* label) {
     c.draw_text_in(Rect(r.x, r.y + 56, r.w, 18), label, rgba(255, 255, 255, 210), 13, Font::Medium, Align::Center);
 }
 
+// Rounded button on the dark login backdrop: primary is solid white, the other translucent.
+void draw_card_button(Canvas& c, Rect r, const char* label, bool primary) {
+    float rad = r.h / 2.0f;
+    c.fill_round_rect(r, rad, primary ? rgba(255, 255, 255, 236) : rgba(255, 255, 255, 46));
+    if (!primary) c.stroke_round_rect(r, rad, rgba(255, 255, 255, 90), 1.0f);
+    c.draw_text_in(r, label, primary ? hex(0x1C1C1E) : rgba(255, 255, 255, 240), 15, Font::Medium, Align::Center);
+}
+
 class LoginWindow : public Window {
 public:
     LoginWindow() : Window("", 640, 480, WF_FULLSCREEN | WF_NO_ZOOM | WF_NO_MINIMIZE) {
@@ -141,31 +149,69 @@ public:
             });
             h->on_click = [this, i] { select(i); };
             add(h);
+            user_hots_.push(h);
         }
 
         int px0 = sw_ / 2 - 177, py = sh_ / 2 + 36;
         pill_ = new PillField(Rect(px0, py, 300, 44));
         pill_x_ = px0;
         add(pill_);
-        pill_->on_submit = [this] { attempt(); };
+        pill_->on_submit = [this] { if (mode_ == Mode::Reset) focus_widget(verify_); else attempt(); };
 
         Hot* go = new Hot(Rect(px0 + 310, py, 44, 44), [](Canvas& c, Rect r) { draw_arrow_button(c, r); });
         go->on_click = [this] { attempt(); };
         add(go);
+        go_ = go;
 
         Hot* restart = new Hot(Rect(sw_ / 2 - 120, sh_ - 150, 120, 74), [](Canvas& c, Rect r) {
             draw_power(c, r, Symbol::Restart, "Restart");
         });
         restart->on_click = [] { power_reboot(); };
         add(restart);
+        restart_ = restart;
 
         Hot* shut = new Hot(Rect(sw_ / 2, sh_ - 150, 120, 74), [](Canvas& c, Rect r) {
             draw_power(c, r, Symbol::Power, "Shut Down");
         });
         shut->on_click = [] { power_shutdown(); };
         add(shut);
+        shut_ = shut;
 
-        focus_widget(pill_);
+        // ---- forgotten password
+        forgot_ = new Hot(Rect(sw_ / 2 - 90, sh_ / 2 + 112, 180, 24), [](Canvas& c, Rect r) {
+            c.draw_text_in(r, "Forgot password?", rgba(255, 255, 255, 215), 14, Font::Medium, Align::Center);
+            int tw = text_width("Forgot password?", 14, Font::Medium);
+            c.fill_rect(Rect(r.x + (r.w - tw) / 2, r.bottom() - 3, tw, 1), rgba(255, 255, 255, 120));
+        });
+        forgot_->on_click = [this] { set_mode(Mode::Confirm); };
+        add(forgot_);
+
+        Rect card = card_rect();
+        int bw = 170, by = card.bottom() - 64;
+        cancel_ = new Hot(Rect(sw_ / 2 - bw - 8, by, bw, 42), [](Canvas& c, Rect r) { draw_card_button(c, r, "Cancel", false); });
+        cancel_->on_click = [this] {
+            if (mode_ == Mode::Reset) sysconfig_recovery_cancel();
+            set_mode(Mode::Normal);
+        };
+        add(cancel_);
+        confirm_ = new Hot(Rect(sw_ / 2 + 8, by, bw, 42), [this](Canvas& c, Rect r) {
+            draw_card_button(c, r, mode_ == Mode::Reset ? "Reset Password" : "Restart", true);
+        });
+        confirm_->on_click = [this] { if (mode_ == Mode::Reset) do_reset(); else restart_into_recovery(); };
+        add(confirm_);
+
+        verify_ = new PillField(Rect(sw_ / 2 - 150, card.y + 176, 300, 44));
+        verify_->placeholder = "Verify password";
+        verify_->on_submit = [this] { do_reset(); };
+        add(verify_);
+
+        // A recovery restart for one of the accounts: offer the reset first.
+        const char* rec = sysconfig_recovery_login();
+        Mode first = Mode::Normal;
+        if (!use_guest_ && rec && *rec)
+            for (int i = 0; i < count_; i++)
+                if (!strcmp(user(i).login, rec)) { selected_ = i; first = Mode::Reset; }
+        set_mode(first);
         set_ticking(true);
     }
 
@@ -182,8 +228,12 @@ public:
         snprintf(date, sizeof(date), "%s, %d %s", weekday_name(dt.weekday), dt.day, month_name(dt.month));
         c.draw_text_in(Rect(0, 166, sw_, 26), date, rgba(255, 255, 255, 230), 20, Font::Medium, Align::Center);
 
-        if (!error_.empty())
+        if (mode_ != Mode::Normal) paint_card(c);
+        else if (!error_.empty())
             c.draw_text_in(Rect(sw_ / 2 - 200, sh_ / 2 + 88, 400, 20), error_.c_str(), hex(0xFF8A80), 14,
+                           Font::Medium, Align::Center);
+        else if (!info_.empty())
+            c.draw_text_in(Rect(sw_ / 2 - 260, sh_ / 2 + 88, 520, 20), info_.c_str(), hex(0xB9F6CA), 14,
                            Font::Medium, Align::Center);
 
         const Vector<Widget*>& ws = widgets();
@@ -216,7 +266,83 @@ public:
     }
 
 private:
+    enum class Mode { Normal, Confirm, Reset };
+
     const UserAccount& user(int i) const { return use_guest_ ? guest_ : sysconfig().users[i]; }
+
+    Rect card_rect() const { return Rect(sw_ / 2 - 230, sh_ / 2 - 130, 460, 330); }
+
+    void set_mode(Mode m) {
+        mode_ = m;
+        bool normal = m == Mode::Normal;
+        for (Hot* h : user_hots_) h->visible = normal;
+        go_->visible = normal;
+        restart_->visible = shut_->visible = normal;
+        forgot_->visible = normal && fails_ > 0 && !use_guest_ && sysconfig_present();
+        cancel_->visible = confirm_->visible = !normal;
+        pill_->visible = m != Mode::Confirm;
+        verify_->visible = m == Mode::Reset;
+        Rect card = card_rect();
+        if (m == Mode::Reset) {
+            pill_->bounds = Rect(sw_ / 2 - 150, card.y + 122, 300, 44);
+            pill_->placeholder = "New password";
+        } else {
+            pill_->bounds = Rect(sw_ / 2 - 177, sh_ / 2 + 36, 300, 44);
+            pill_->placeholder = "Password";
+        }
+        pill_x_ = pill_->bounds.x;
+        pill_->set_text("");
+        verify_->set_text("");
+        error_ = "";
+        if (m != Mode::Confirm) focus_widget(pill_);
+        invalidate();
+    }
+
+    void paint_card(Canvas& c) {
+        Rect card = card_rect();
+        GlassStyle gs = glass_style_panel(true);
+        gs.radius = 26;
+        c.draw_shadow(card, 26, 30, rgba(0, 0, 0, 90), 0, 10);
+        glass_render(c, card, gs, c.clip());
+        c.stroke_round_rect(card, 26, rgba(255, 255, 255, 60), 1.0f);
+        const UserAccount& u = user(selected_);
+        Rect text(card.x + 32, card.y + 28, card.w - 64, card.h);
+        if (mode_ == Mode::Confirm) {
+            c.draw_text_in(Rect(text.x, text.y, text.w, 30), "Forgot your password?", rgba(255, 255, 255, 255), 22, Font::Bold, Align::Center);
+            String body = String("KleinOS will restart into Recovery. When it starts again, you can choose a new password for ") +
+                          u.full_name + ". Your files stay as they are.";
+            c.draw_text_wrapped(Rect(text.x, text.y + 50, text.w, 140), body.c_str(), rgba(255, 255, 255, 220), 15, Font::Regular, Align::Center, 4);
+            c.draw_text_wrapped(Rect(text.x, text.y + 168, text.w, 60), "Anyone who can restart this computer can do this, so keep it somewhere safe.",
+                                rgba(255, 255, 255, 150), 13, Font::Regular, Align::Center, 2);
+        } else {
+            c.draw_text_in(Rect(text.x, text.y, text.w, 30), "Reset Password", rgba(255, 255, 255, 255), 22, Font::Bold, Align::Center);
+            String sub = String("Choose a new password for ") + u.full_name + ".";
+            c.draw_text_in(Rect(text.x, text.y + 44, text.w, 22), sub.c_str(), rgba(255, 255, 255, 215), 15, Font::Regular, Align::Center);
+        }
+        if (!error_.empty())
+            c.draw_text_in(Rect(card.x + 20, card.bottom() - 98, card.w - 40, 20), error_.c_str(), hex(0xFF8A80), 14, Font::Medium, Align::Center);
+    }
+
+    void restart_into_recovery() {
+        if (!sysconfig_request_recovery(user(selected_).login)) {
+            error_ = "Recovery couldn't be prepared on this disk.";
+            invalidate();
+            return;
+        }
+        power_reboot();
+    }
+
+    void do_reset() {
+        if (mode_ != Mode::Reset) return;
+        String a = pill_->get_text(), b = verify_->get_text();
+        if (a.empty()) { error_ = "Enter a new password."; focus_widget(pill_); invalidate(); return; }
+        if (a != b) { error_ = "The passwords don't match."; verify_->set_text(""); focus_widget(verify_); invalidate(); return; }
+        if (!sysconfig_recovery_reset(a.c_str())) { error_ = "The new password couldn't be saved."; invalidate(); return; }
+        fails_ = 0;
+        set_mode(Mode::Normal);
+        info_ = "Password changed. Log in with your new password.";
+        invalidate();
+    }
 
     void draw_user(Canvas& c, Rect r, int i, bool sel) const {
         const UserAccount& u = user(i);
@@ -234,9 +360,12 @@ private:
     }
 
     void select(int i) {
+        if (mode_ != Mode::Normal) return;
+        if (i != selected_) { fails_ = 0; forgot_->visible = false; }
         selected_ = i;
         pill_->set_text("");
         error_ = "";
+        info_ = "";
         focus_widget(pill_);
         invalidate();
     }
@@ -245,6 +374,9 @@ private:
         const UserAccount& u = user(selected_);
         if (!sysconfig_check_password(u, pill_->get_text())) {
             error_ = "Incorrect password";
+            info_ = "";
+            fails_++;
+            forgot_->visible = !use_guest_ && sysconfig_present();
             pill_->set_text("");
             shaking_ = true;
             shake_t0_ = timer_ms();
@@ -265,7 +397,12 @@ private:
     int pill_x_ = 0;
     bool shaking_ = false;
     uint64_t shake_t0_ = 0, last_ = 0;
-    String error_;
+    String error_, info_;
+    Mode mode_ = Mode::Normal;
+    int fails_ = 0;
+    Vector<Hot*> user_hots_;
+    Hot *go_ = nullptr, *restart_ = nullptr, *shut_ = nullptr, *forgot_ = nullptr, *cancel_ = nullptr, *confirm_ = nullptr;
+    PillField* verify_ = nullptr;
 };
 
 void icon(Canvas& c, Rect r) {

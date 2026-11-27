@@ -23,6 +23,13 @@ void session_enter_desktop(const char* full_name, const char* login) {
     klog("session: %s (%s) logged in", full_name, login);
     String msg = String("Welcome, ") + full_name + ". Press Ctrl+Space to search.";
     wm::notify("Welcome to KleinOS", msg.c_str());
+    uint64_t reset_at = 0;
+    if (sysconfig_take_reset_notice(login, &reset_at)) {
+        DateTime t = unix_to_datetime(reset_at + rtc_utc_offset_minutes() * 60);
+        String body = String::format("Reset in Recovery on %d %s at %02d:%02d. Not you? Change it in Settings.",
+                                     t.day, month_name(t.month), t.hour, t.minute);
+        wm::notify("Your password was reset", body.c_str(), "settings");
+    }
 }
 
 void session_logout() {
@@ -56,6 +63,7 @@ void session_start(BootMode mode) {
             wm::set_wallpaper(c.wallpaper);
             userdata_load();
             userdata_enable_autosave();
+            sysconfig_take_recovery_request();
             const char* first = c.setup_complete ? "login" : "oobe";
             if (app_find(first)) {
                 wm::set_shell_visible(false);

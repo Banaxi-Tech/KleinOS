@@ -50,6 +50,17 @@ enum class PasswordChangeResult { Saved, Unavailable, IncorrectPassword, SaveFai
 PasswordChangeResult sysconfig_change_password(const char* login, const char* current_password,
                                               const char* new_password);
 
+// Forgotten passwords. The login window asks for a recovery restart; the request is
+// read (and deleted) once, at the next boot, so resetting always needs a full restart,
+// never just a locked screen. The account then gets a reset notice at its next login.
+bool sysconfig_request_recovery(const char* login);   // writes the request (call power_reboot after)
+void sysconfig_take_recovery_request();               // boot only: picks up and deletes the request
+const char* sysconfig_recovery_login();               // account being recovered this boot, "" if none
+bool sysconfig_recovery_reset(const char* new_password);
+void sysconfig_recovery_cancel();
+// True once after a recovery reset of this account; *when = unix time of the reset.
+bool sysconfig_take_reset_notice(const char* login, uint64_t* when);
+
 // User file persistence: load /Users from disk; save it (debounced) on change.
 void userdata_load();
 void userdata_enable_autosave();

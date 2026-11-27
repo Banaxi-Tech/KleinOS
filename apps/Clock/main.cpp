@@ -6,6 +6,7 @@
 #include "ui/wm.h"
 #include "drivers/rtc.h"
 #include "drivers/power.h"
+#include "drivers/sound.h"
 #include "arch/interrupts.h"
 #include "lib/math.h"
 #include "lib/kstring.h"
@@ -128,9 +129,17 @@ public:
 
         if (tm_running_ && now >= tm_end_) finish_timer(now);
         if (beeps_left_ > 0 && now >= next_beep_) {
-            speaker_beep(880, 160);
+            if (sound_available()) {
+                // a bright three-note chime, repeated: kinder than a beep and easy to hear
+                static const float notes[3] = {1046.5f, 1318.5f, 1568.0f};
+                int i = (3 - beeps_left_ % 3) % 3;   // up: C, E, G, then a pause
+                sound_tone(notes[i], 420, 55, Timbre::Bell);
+                next_beep_ = now + (i == 2 ? 700 : 180);
+            } else {
+                speaker_beep(880, 160);
+                next_beep_ = now + 300;
+            }
             beeps_left_--;
-            next_beep_ = now + 300;
         }
 
         bool animating = tab_ == Tab::World || (tab_ == Tab::Stopwatch && sw_running_) ||
@@ -304,7 +313,7 @@ private:
     void finish_timer(uint64_t now) {
         tm_running_ = false;
         tm_remaining_ = 0;
-        beeps_left_ = 6;
+        beeps_left_ = 9;
         next_beep_ = now;
         wm::notify("Timer", "Time is up", "clock");
         refresh_buttons();

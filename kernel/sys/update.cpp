@@ -18,6 +18,7 @@
 #include "net/crypto.h"
 #include "net/http.h"
 #include "net/net.h"
+#include "grub_hdd_cfg.h"
 #include "ui/wm.h"
 
 namespace update {
@@ -36,6 +37,8 @@ constexpr uint32_t kArchId = 2;
 constexpr uint32_t kFormat = 1, kPatchFormat = 2;
 constexpr size_t kMaxPackage = 64u << 20;
 constexpr uint64_t kConfirmAfterMs = 30000;
+constexpr uint64_t kStartedOkMs = 15000;      // up this long: the start didn't fail (clears boot_fails)
+constexpr uint64_t kBootConfigMs = 20000;     // then bring /boot/grub/grub.cfg up to date
 constexpr uint64_t kFirstCheckMs = 45000;
 constexpr uint64_t kRecheckMs = 6ull * 3600 * 1000;
 constexpr uint64_t kWorkBudgetMs = 8;
@@ -73,7 +76,10 @@ Step g_step = Step::None;
 char g_slot = 0;
 char g_env_slot = 0, g_env_try = 0;
 char g_env_pending[24], g_env_bad[24];
+int g_env_fails;                // starts in a row that never got going (GRUB counts, we clear)
 bool g_confirmed = true;
+bool g_recovery_boot;           // GRUB opened Recovery after repeated failed starts
+bool g_boot_config_checked;
 
 net::HttpRequest* g_req;
 char g_error[120];
@@ -148,6 +154,8 @@ bool env_read() {
         g_env_try = v[0] == 'a' || v[0] == 'b' ? v[0] : 0;
         env_get(body, "pending", g_env_pending, sizeof(g_env_pending));
         env_get(body, "bad", g_env_bad, sizeof(g_env_bad));
+        env_get(body, "boot_fails", v, sizeof(v));
+        g_env_fails = atoi(v);
     }
     kfree(data);
     return ok;
@@ -157,10 +165,10 @@ bool env_read() {
 bool env_write() {
     static uint8_t blk[1024];
     memset(blk, '#', sizeof(blk));
-    char text[160];
+    char text[200];
     char tr[2] = {g_env_try, 0};
-    int n = snprintf(text, sizeof(text), "# GRUB Environment Block\nslot=%c\ntry_slot=%s\npending=%s\nbad=%s\n", g_env_slot, tr,
-                     g_env_pending, g_env_bad);
+    int n = snprintf(text, sizeof(text), "# GRUB Environment Block\nslot=%c\ntry_slot=%s\npending=%s\nbad=%s\nboot_fails=%d\n",
+                     g_env_slot, tr, g_env_pending, g_env_bad, g_env_fails);
     memcpy(blk, text, (size_t)n);
     return fat32::write_file(kEnvPath, blk, sizeof(blk), rtc_unix_time()) && fat32::flush();
 }
@@ -445,6 +453,34 @@ void step_commit() {
     wm::notify("Software Update", body, "settings");
 }
 
+// Installs that predate a boot feature (like Recovery) still have the grub.cfg they
+// were set up with: replace it with this version's, once this version has proven it
+// starts. Written whole, read back, and put back as it was if that fails.
+void update_boot_config() {
+    static const char kPath[] = "/boot/grub/grub.cfg";
+    String want = kGrubHddCfg;
+    char v[8];
+    if (boot_arg("storage", v, sizeof(v)) && !strcmp(v, "usb")) {
+        long at = want.find("mode=installed");
+        if (at >= 0) want.insert((size_t)at + 14, " storage=usb", 12);
+    }
+    uint8_t* old = nullptr;
+    size_t old_size = 0;
+    if (!fat32::read_file(kPath, &old, &old_size)) return;   // not a GRUB install we know
+    if (old_size == want.size() && !memcmp(old, want.c_str(), old_size)) { kfree(old); return; }
+    bool ok = fat32::write_file(kPath, want.c_str(), want.size(), rtc_unix_time()) && fat32::flush();
+    uint8_t* back = nullptr;
+    size_t back_size = 0;
+    ok = ok && fat32::read_file(kPath, &back, &back_size) && back_size == want.size() && !memcmp(back, want.c_str(), back_size);
+    kfree(back);
+    if (!ok) {
+        fat32::write_file(kPath, old, old_size, rtc_unix_time());
+        fat32::flush();
+    }
+    kfree(old);
+    klog("update: boot configuration %s", ok ? "updated" : "could not be updated, kept the old one");
+}
+
 void confirm_slot(const char* why) {
     g_confirmed = true;
     g_env_slot = g_slot;
@@ -461,6 +497,15 @@ void poll() {
         // Without that input a black or frozen screen would count as a good update;
         // restarting before then goes back to the previous version.
         confirm_slot("used after settling");
+    }
+    if (g_env_fails && !g_recovery_boot && now >= kStartedOkMs) {
+        klog("update: started fine after %d failed start(s)", g_env_fails > 3 ? 3 : g_env_fails);
+        g_env_fails = 0;
+        env_write();
+    }
+    if (!g_boot_config_checked && g_confirmed && !g_recovery_boot && now >= kBootConfigMs) {
+        g_boot_config_checked = true;
+        update_boot_config();
     }
     switch (g_step) {
         case Step::Manifest:
@@ -519,6 +564,8 @@ void init() {
         return;
     }
     g_slot = v[0];
+    char rv[4];
+    g_recovery_boot = boot_arg("recovery", rv, sizeof(rv));
     // try_slot is cleared by GRUB when it boots it, so a pending version with
     // nothing left to try while we run the old slot means that boot failed
     if (g_slot == g_env_slot && !g_env_try && g_env_pending[0]) {
@@ -539,6 +586,39 @@ void init() {
 // marked it bad, e.g. when "Forgot password?" restarted right after updating.)
 void confirm_by_user() {
     if (g_slot && !g_confirmed && input_last_ms() > 0) confirm_slot("restart chosen by the user");
+}
+
+// ---- Recovery (GRUB boots it after 3 failed starts in a row)
+namespace {
+bool recovery_env() {
+    char v[4];
+    if (!boot_arg("slot", v, sizeof(v)) || (v[0] != 'a' && v[0] != 'b') || !fat32::mounted()) return false;
+    g_slot = v[0];
+    return env_read();
+}
+}
+
+bool recovery_boot() { char v[4]; return boot_arg("recovery", v, sizeof(v)); }
+
+bool previous_version_available() {
+    if (!recovery_env()) return false;
+    char k[32], i[32];
+    slot_path(0, other_slot(), k, sizeof(k));
+    slot_path(1, other_slot(), i, sizeof(i));
+    return fat32::exists(k) && fat32::exists(i);
+}
+
+bool recovery_finish(bool previous_version) {
+    if (!recovery_env()) return false;
+    if (previous_version) {
+        if (!previous_version_available()) return false;
+        g_env_slot = other_slot();
+        klog("update: recovery switches to slot %c", g_env_slot);
+    }
+    g_env_fails = 0;
+    g_env_try = 0;
+    g_env_pending[0] = 0;
+    return env_write();
 }
 
 State state() { return g_state; }

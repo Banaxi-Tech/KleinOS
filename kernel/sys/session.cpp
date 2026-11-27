@@ -5,6 +5,7 @@
 #include "lib/kstring.h"
 #include "lib/log.h"
 #include "sys/sysconfig.h"
+#include "sys/update.h"
 #include "drivers/input.h"
 #include "drivers/rtc.h"
 #include "ui/theme.h"
@@ -61,6 +62,14 @@ void session_start(BootMode mode) {
             if (c.accent) theme_set_accent(c.accent);
             theme_set_dark(c.dark_mode);
             wm::set_wallpaper(c.wallpaper);
+            // After 3 failed starts GRUB boots Recovery: open it before loading anything
+            // else from the disk, in case that is what keeps failing.
+            if (update::recovery_boot() && app_find("recovery")) {
+                klog("session: starting Recovery");
+                wm::set_shell_visible(false);
+                app_launch("recovery");
+                return;
+            }
             userdata_load();
             userdata_enable_autosave();
             sysconfig_take_recovery_request();

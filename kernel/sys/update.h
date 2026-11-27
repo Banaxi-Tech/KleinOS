@@ -21,4 +21,10 @@ const char* error();             // last failure, for display
 int progress();                  // 0..100 for the current download or install
 char active_slot();              // 'a', 'b', or 0 when not installed
 
+// Recovery: GRUB starts it (boot arg recovery=1) after 3 failed starts in a row.
+bool recovery_boot();
+bool previous_version_available();          // the other slot holds a complete system
+// Clear the failed-start count (and switch to the other slot); restart afterwards.
+bool recovery_finish(bool previous_version);
+
 }  // namespace update

@@ -160,6 +160,12 @@ $(BUILD)/buildnum.stamp: $(SRCS) $(ASMS) $(HDRS) $(DL_SRCS) assets/fonts/*
 
 $(BUILD)/gen/build_number.h: $(BUILD)/buildnum.stamp
 
+# The installed system's grub.cfg, built into the kernel so updates can bring old installs up to date.
+$(BUILD)/gen/grub_hdd_cfg.h: tools/grub-hdd.cfg
+	@mkdir -p $(BUILD)/gen
+	@{ printf 'static const char kGrubHddCfg[] =\n'; sed 's/\\/\\\\/g; s/"/\\"/g; s/^/    "/; s/$$/\\n"/' $<; printf '    ;\n'; } > $@
+$(BUILD)/kernel/sys/update.cpp.o: $(BUILD)/gen/grub_hdd_cfg.h
+
 # ---------------------------------------------------------------- compile
 $(BUILD)/%.cpp.o: %.cpp | $(BUILD)/gen/build_number.h
 	@mkdir -p $(dir $@)

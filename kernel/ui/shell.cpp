@@ -651,6 +651,12 @@ void open_bar_popup(int index) {
 
 // ================================================================ spotlight
 
+// Screens the session itself opens (login, first-run setup, installer, recovery): not
+// apps to launch from a running desktop.
+bool session_screen(const AppInfo* a) {
+    return !strcmp(a->id, "login") || !strcmp(a->id, "oobe") || !strcmp(a->id, "setup") || !strcmp(a->id, "recovery");
+}
+
 void spot_search() {
     g_spot_results.clear();
     g_spot_sel = 0;
@@ -668,6 +674,7 @@ void spot_search() {
     }
     for (int i = 0; i < app_count(); i++) {
         const AppInfo* a = app_get(i);
+        if (session_screen(a)) continue;
         String name = String(a->name).lower();
         String id = String(a->id);
         if (name.find(q.c_str()) >= 0 || id.find(q.c_str()) >= 0 || String(a->category).lower().find(q.c_str()) == 0) {
@@ -794,6 +801,7 @@ void lp_filter() {
     String q = g_lp_query.lower();
     for (int i = 0; i < app_count(); i++) {
         const AppInfo* a = app_get(i);
+        if (session_screen(a)) continue;
         if (q.empty() || String(a->name).lower().find(q.c_str()) >= 0) g_lp_apps.push(a);
     }
     // alphabetical

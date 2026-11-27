@@ -193,15 +193,57 @@ void draw_launchpad_icon(Canvas& c, Rect r) {
     }
 }
 
-void draw_dock(Canvas& s, Rect clip) {
-    if (!g_dock_rect.intersects(clip.expand(kDockMaxIcon))) return;
+// While no window is under the Dock, its shadow and glass only cover wallpaper: render
+// them once (per Dock size and look) and copy. Otherwise every window whose shadow
+// reached the Dock made it re-frost the whole Dock, every frame of a drag.
+constexpr int kDockCacheMargin = 36;   // the Dock's shadow (blur 18, offset 6)
+Canvas* g_dock_glass;
+Rect g_dock_glass_rect;
+uint32_t g_dock_glass_key = ~0u;
+
+bool dock_backdrop_is_wallpaper() {
+    Rect r = g_dock_rect.expand(kDockCacheMargin + glass_margin(panel_glass()));
+    for (Window* w : windows())
+        if (!w->minimized() && !w->closing_ && w->frame().intersects(r)) return false;
+    return true;
+}
+
+void render_dock_glass(Canvas& dst, Rect dock, Rect clip) {
     GlassStyle gs = panel_glass();
     gs.radius = 24;
+    dst.save();
+    dst.clip_to(clip);
+    dst.draw_shadow(dock, 24, 18, rgba(0, 0, 0, 60), 0, 6);
+    dst.restore();
+    glass_render(dst, dock, gs, clip);
+}
+
+void draw_dock_glass_cached(Canvas& s, Rect clip) {
+    Rect cr = g_dock_rect.expand(kDockCacheMargin).intersect(Rect(0, 0, W, H));
+    uint32_t key = (uint32_t)wallpaper() * 2654435761u ^ (theme().dark ? 1u : 0u) ^ (reduce_transparency() ? 2u : 0u) ^
+                   ((uint32_t)(glass_intensity() * 1000) << 8) ^ ((uint32_t)cr.x << 3) ^ ((uint32_t)cr.w << 13) ^ ((uint32_t)cr.y << 22);
+    if (!g_dock_glass || key != g_dock_glass_key || cr != g_dock_glass_rect) {
+        g_dock_glass_key = key;
+        g_dock_glass_rect = cr;
+        int m = glass_margin(panel_glass());
+        Rect wr = cr.expand(m).intersect(Rect(0, 0, W, H));
+        Canvas tmp(wr.w, wr.h);
+        tmp.blit(wallpaper_canvas(), wr, 0, 0);
+        render_dock_glass(tmp, g_dock_rect.offset(-wr.x, -wr.y), cr.offset(-wr.x, -wr.y));
+        delete g_dock_glass;
+        g_dock_glass = new Canvas(cr.w, cr.h);
+        g_dock_glass->blit(tmp, cr.offset(-wr.x, -wr.y), 0, 0);
+    }
     s.save();
     s.clip_to(clip);
-    s.draw_shadow(g_dock_rect, 24, 18, rgba(0, 0, 0, 60), 0, 6);
+    s.blit(*g_dock_glass, cr.x, cr.y);
     s.restore();
-    glass_render(s, g_dock_rect, gs, clip);
+}
+
+void draw_dock(Canvas& s, Rect clip) {
+    if (!g_dock_rect.intersects(clip.expand(kDockMaxIcon))) return;
+    if (dock_backdrop_is_wallpaper()) draw_dock_glass_cached(s, clip);
+    else render_dock_glass(s, g_dock_rect, clip);
     s.save();
     s.clip_to(clip);
     s.stroke_round_rect(g_dock_rect, 24, theme().dark ? rgba(255, 255, 255, 40) : rgba(255, 255, 255, 110), 1.0f);
@@ -442,15 +484,39 @@ void draw_logo(Canvas& s, Rect r, Color c) {
     s.draw_line(cx - 1.5f, cy - 1, cx + 5.5f, cy + 7, c, 2.6f);
 }
 
-void draw_menubar(Canvas& s, Rect clip) {
-    Rect bar(0, 0, W, kMenubarHeight);
-    if (!bar.intersects(clip)) return;
+// Windows can't go under the menubar, so its glass only ever frosts the wallpaper:
+// render it once per look and copy it. (Re-blurring it whenever a window's shadow
+// touched it cost more than the rest of a window drag together, and it grew every
+// such frame to the full screen width.)
+Canvas* g_bar_glass;
+uint32_t g_bar_key = ~0u;
+
+const Canvas& menubar_glass() {
     GlassStyle gs = glass_style_bar(theme().dark);
     gs.blur *= glass_intensity();
     if (reduce_transparency()) gs.tint = with_alpha(gs.tint, 235);
-    glass_render(s, bar, gs, clip);
+    uint32_t key = (uint32_t)wallpaper() * 2654435761u ^ (theme().dark ? 1u : 0u) ^ (reduce_transparency() ? 2u : 0u) ^
+                   ((uint32_t)(glass_intensity() * 1000) << 8) ^ ((uint32_t)W << 20);
+    if (!g_bar_glass || key != g_bar_key) {
+        g_bar_key = key;
+        int m = glass_margin(gs);
+        Canvas tmp(W, kMenubarHeight + m);
+        tmp.blit(wallpaper_canvas(), 0, 0);
+        Rect bar(0, 0, W, kMenubarHeight);
+        glass_render(tmp, bar, gs, bar);
+        delete g_bar_glass;
+        g_bar_glass = new Canvas(W, kMenubarHeight);
+        g_bar_glass->blit(tmp, 0, 0);
+    }
+    return *g_bar_glass;
+}
+
+void draw_menubar(Canvas& s, Rect clip) {
+    Rect bar(0, 0, W, kMenubarHeight);
+    if (!bar.intersects(clip)) return;
     s.save();
     s.clip_to(clip);
+    s.blit(menubar_glass(), 0, 0);
     s.fill_rect(Rect(0, kMenubarHeight - 1, W, 1), theme().dark ? rgba(0, 0, 0, 80) : rgba(255, 255, 255, 80));
     Color tc = shell_text();
     if (g_open_bar_menu == -2) s.fill_round_rect(g_logo_rect.inset(2, 4), 6, rgba(255, 255, 255, theme().dark ? 40 : 90));
@@ -1006,8 +1072,8 @@ void shell_tick(uint64_t now) {
 
 void shell_glass_rects(Vector<Rect>& out) {
     if (shell_visible()) {
-        out.push(Rect(0, 0, W, kMenubarHeight).expand(glass_margin(glass_style_bar(false))));
-        out.push(g_dock_rect.expand(glass_margin(panel_glass())));
+        // (the menubar's glass is cached, any part of it can be redrawn on its own)
+        if (!dock_backdrop_is_wallpaper()) out.push(g_dock_rect.expand(glass_margin(panel_glass())));
         if (g_dock_hover_index >= 0) out.push(Rect(g_dock_rect.x - 200, g_dock_rect.y - 80, g_dock_rect.w + 400, 80));   // tooltip
     }
     int m = glass_margin(panel_glass());

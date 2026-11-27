@@ -48,6 +48,8 @@ uint8_t g_buttons;
 uint64_t g_frames;
 uint64_t g_last_frame_ms, g_last_shell_ms;
 uint64_t g_next_draw_ms;
+uint64_t g_last_work_ms;     // how long the last composed frame took
+bool g_cheap_drag;           // this drag is too slow for live glass on the moving window
 float g_fps;
 uint64_t g_fps_t0, g_fps_n;
 
@@ -86,6 +88,70 @@ void build_cursor() {
 }
 
 Rect shadow_bounds(Window* w) { return w->frame().expand(50); }
+
+// ----------------------------------------------------------------- shadow cache
+// A window's shadow only depends on its size and on being active, but computing it
+// is a distance field per pixel. Render it once into an alpha mask (shadows are black,
+// so the mask is all there is) and darken with it; re-render only when the size changes.
+struct ShadowMask {
+    int w = 0, h = 0, blur = 0, dy = 0, alpha = 0;   // key (w/h: the window frame)
+    int ox = 0, oy = 0, mw = 0, mh = 0;              // mask origin relative to the frame, and size
+    Rect hole;                                       // fully covered by the window: skipped
+    uint8_t* a = nullptr;
+    uint64_t used = 0;
+};
+constexpr int kShadowSlots = 6;
+ShadowMask g_shadows[kShadowSlots];
+uint64_t g_shadow_tick;
+
+const ShadowMask& shadow_mask(int w, int h, int blur, int dy, int alpha) {
+    g_shadow_tick++;
+    ShadowMask* lru = &g_shadows[0];
+    for (ShadowMask& m : g_shadows) {
+        if (m.a && m.w == w && m.h == h && m.blur == blur && m.dy == dy && m.alpha == alpha) { m.used = g_shadow_tick; return m; }
+        if (m.used < lru->used) lru = &m;
+    }
+    ShadowMask& m = *lru;
+    kfree(m.a);
+    int ext = (int)ceilf(blur * 1.5f) + 2;
+    m.w = w; m.h = h; m.blur = blur; m.dy = dy; m.alpha = alpha;
+    m.ox = -ext; m.oy = dy - ext; m.mw = w + 2 * ext; m.mh = h + 2 * ext;
+    Canvas tmp(m.mw, m.mh);
+    tmp.clear(0);
+    Rect frame(-m.ox, -m.oy, w, h);
+    tmp.draw_shadow(frame, kWindowRadius, (float)blur, rgba(0, 0, 0, alpha), 0, dy);
+    m.a = (uint8_t*)kmalloc((size_t)m.mw * m.mh);
+    for (int y = 0; y < m.mh; y++) {
+        const uint32_t* row = tmp.row(y);
+        for (int x = 0; x < m.mw; x++) m.a[(size_t)y * m.mw + x] = row[x] >> 24;
+    }
+    m.hole = frame.inset((int)(kWindowRadius * 0.3f) + 1).offset(m.ox, m.oy);   // relative to the frame origin
+    m.used = g_shadow_tick;
+    return m;
+}
+
+void draw_window_shadow(Canvas& s, Rect f, int blur, int dy, int alpha, Rect clip) {
+    const ShadowMask& m = shadow_mask(f.w, f.h, blur, dy, alpha);
+    Rect box(f.x + m.ox, f.y + m.oy, m.mw, m.mh);
+    Rect cl = box.intersect(clip).intersect(Rect(0, 0, s.width(), s.height()));
+    if (cl.empty()) return;
+    Rect hole = m.hole.offset(f.x, f.y);
+    for (int y = cl.y; y < cl.bottom(); y++) {
+        uint32_t* dst = s.row(y);
+        const uint8_t* src = m.a + (size_t)(y - box.y) * m.mw - box.x;
+        bool in_hole_rows = y >= hole.y && y < hole.bottom();
+        for (int x = cl.x; x < cl.right(); x++) {
+            if (in_hole_rows && x >= hole.x && x < hole.right()) { x = hole.right() - 1; continue; }
+            uint32_t a = src[x];
+            if (!a) continue;
+            // black at alpha a over p: scale the colour channels, the screen stays opaque
+            uint32_t p = dst[x], k = 255 - a;
+            uint32_t rb = (((p & 0x00FF00FF) * k + 0x00800080) >> 8) & 0x00FF00FF;
+            uint32_t g = ((((p >> 8) & 0xFF) * k + 0x80) >> 8) << 8;
+            dst[x] = (p & 0xFF000000u) | rb | g;
+        }
+    }
+}
 
 GlassStyle window_glass() {
     GlassStyle s = glass_style_window(theme().dark);
@@ -501,10 +567,23 @@ void compose_window(Canvas& s, Window* w, Rect clip) {
         return;
     }
     bool active = w == g_active;
-    s.draw_shadow(f, kWindowRadius, (active ? 26 : 16) >> (g_lite ? 1 : 0), theme().dark ? rgba(0, 0, 0, active ? 170 : 120) : rgba(0, 0, 0, active ? 75 : 45), 0, active ? 12 : 6);
+    {
+        int blur = (active ? 26 : 16) >> (g_lite ? 1 : 0), alpha = theme().dark ? (active ? 170 : 120) : (active ? 75 : 45);
+        if (g_drag == Drag::Resize && w == g_drag_win)   // a new size every frame: no point caching
+            s.draw_shadow(f, kWindowRadius, blur, rgba(0, 0, 0, alpha), 0, active ? 12 : 6);
+        else
+            draw_window_shadow(s, f, blur, active ? 12 : 6, alpha, clip);
+    }
     // glass part (titlebar / sidebar / whole window)
     Rect gr = window_glass_rect(w);
-    if (gr.intersects(clip)) {
+    if (gr.intersects(clip) && g_cheap_drag && w == g_drag_win && g_drag == Drag::Move) {
+        // re-frosting the backdrop under a moving window every frame is what a slow CPU
+        // can't keep up with: use the glass tint, solid, until the window is let go
+        s.save();
+        s.clip_to(gr);
+        s.fill_round_rect(f, kWindowRadius, theme().dark ? rgba(46, 46, 50, 255) : rgba(238, 238, 242, 255));
+        s.restore();
+    } else if (gr.intersects(clip)) {
         GlassStyle gs = window_glass();
         gs.radius = kWindowRadius;
         // render glass for the full window shape but only inside the glass region
@@ -577,19 +656,52 @@ void compose_window(Canvas& s, Window* w, Rect clip) {
     s.restore();
 }
 
-void compose_region(Rect r) {
-    Canvas& s = *g_screen;
+// Everything at or below window index `upto` (exclusive), inside q.
+void compose_below(Canvas& s, Rect q, size_t upto, bool& preview_drawn) {
+    if (q.empty()) return;
     s.reset_clip();
     s.save();
-    s.clip_to(r);
-    s.blit(*g_wallpaper, 0, 0);
-    shell_draw_desktop(s, r);
+    s.clip_to(q);
+    s.blit(*g_wallpaper, 0, 0); shell_draw_desktop(s, q);
     s.restore();
-    bool preview_drawn = false;
-    for (Window* w : g_windows) {
+    for (size_t i = 0; i < upto; i++) {
+        Window* w = g_windows[i];
         if (w->minimized_ || w->closing_) continue;
-        if (g_snap != Snap::None && w == g_drag_win) { draw_snap_preview(s, r); preview_drawn = true; }
-        compose_window(s, w, r);
+        if (g_snap != Snap::None && w == g_drag_win) { draw_snap_preview(s, q); preview_drawn = true; }
+        compose_window(s, w, q);
+    }
+}
+
+void compose_region(Rect r) {
+    Canvas& s = *g_screen;
+    // The highest window with opaque content covering a good part of r hides everything
+    // under it there: draw the wallpaper and lower windows only around it.
+    size_t occ = g_windows.size();
+    Rect O;
+    for (size_t i = g_windows.size(); i > 0; i--) {
+        Window* w = g_windows[i - 1];
+        if (w->minimized_ || w->closing_ || (w->flags() & WF_GLASS)) continue;
+        Rect c = w->content_rect();
+        if (w->sidebar_width() > 0) { c.x += w->sidebar_width(); c.w -= w->sidebar_width(); }   // the body is opaque
+        if (!(w->flags() & WF_FULLSCREEN)) c.h -= kWindowRadius;   // rounded bottom corners show what's behind
+        Rect o = c.intersect(r);
+        if ((int64_t)o.w * o.h * 4 >= (int64_t)r.w * r.h) { occ = i - 1; O = o; break; }
+    }
+    bool preview_drawn = false;
+    if (occ == g_windows.size()) {
+        compose_below(s, r, g_windows.size(), preview_drawn);
+    } else {
+        compose_below(s, Rect(r.x, r.y, r.w, O.y - r.y), occ, preview_drawn);
+        compose_below(s, Rect(r.x, O.bottom(), r.w, r.bottom() - O.bottom()), occ, preview_drawn);
+        compose_below(s, Rect(r.x, O.y, O.x - r.x, O.h), occ, preview_drawn);
+        compose_below(s, Rect(O.right(), O.y, r.right() - O.right(), O.h), occ, preview_drawn);
+        s.reset_clip();
+        for (size_t i = occ; i < g_windows.size(); i++) {
+            Window* w = g_windows[i];
+            if (w->minimized_ || w->closing_) continue;
+            if (g_snap != Snap::None && w == g_drag_win && !preview_drawn) { draw_snap_preview(s, r); preview_drawn = true; }
+            compose_window(s, w, r);
+        }
     }
     if (g_snap != Snap::None && !preview_drawn) draw_snap_preview(s, r);
     if (g_shell_visible) shell_draw(s, r);
@@ -789,6 +901,7 @@ void handle_mouse(const InputEvent& ev) {
         }
         if (g_drag == Drag::Move && g_drag_win) {
             Window* w = g_drag_win;
+            if (g_cheap_drag) { g_cheap_drag = false; damage(shadow_bounds(w)); }
             Snap z = g_snap;
             set_snap(Snap::None);
             if (z != Snap::None) {
@@ -1053,6 +1166,7 @@ void set_wallpaper(int i) {
     damage_all();
 }
 int wallpaper() { return g_wallpaper_index; }
+const Canvas& wallpaper_canvas() { return *g_wallpaper; }
 void set_glass_intensity(float k) { g_glass_k = kclamp(k, 0.0f, 1.5f); damage_all(); }
 float glass_intensity() { return g_glass_k; }
 void set_dock_magnification(bool on) { g_dock_mag = on; damage_all(); }
@@ -1138,6 +1252,8 @@ void frame() {
         for (Rect& r : dmg) compose_region(r);
         for (Rect& r : dmg) present(r);
         uint64_t work_ms = timer_ms() - work_t0;
+        g_last_work_ms = work_ms;
+        if (g_drag == Drag::Move && !g_cheap_drag && (g_lite || work_ms > 20)) g_cheap_drag = true;
         g_next_draw_ms = work_ms >= 8 ? timer_ms() + kmin(work_ms, (uint64_t)100) : 0;
         if (work_ms >= 30) {
             static uint64_t last_slow_log;

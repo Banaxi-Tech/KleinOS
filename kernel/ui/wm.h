@@ -35,6 +35,7 @@ void set_shell_visible(bool visible);   // menubar + dock (off for installer/log
 bool shell_visible();
 void set_wallpaper(int index);
 int wallpaper();
+const Canvas& wallpaper_canvas();       // the rendered wallpaper, screen sized
 void notify(const char* title, const char* body, const char* app_id = nullptr);
 void open_spotlight();
 void open_launchpad();
